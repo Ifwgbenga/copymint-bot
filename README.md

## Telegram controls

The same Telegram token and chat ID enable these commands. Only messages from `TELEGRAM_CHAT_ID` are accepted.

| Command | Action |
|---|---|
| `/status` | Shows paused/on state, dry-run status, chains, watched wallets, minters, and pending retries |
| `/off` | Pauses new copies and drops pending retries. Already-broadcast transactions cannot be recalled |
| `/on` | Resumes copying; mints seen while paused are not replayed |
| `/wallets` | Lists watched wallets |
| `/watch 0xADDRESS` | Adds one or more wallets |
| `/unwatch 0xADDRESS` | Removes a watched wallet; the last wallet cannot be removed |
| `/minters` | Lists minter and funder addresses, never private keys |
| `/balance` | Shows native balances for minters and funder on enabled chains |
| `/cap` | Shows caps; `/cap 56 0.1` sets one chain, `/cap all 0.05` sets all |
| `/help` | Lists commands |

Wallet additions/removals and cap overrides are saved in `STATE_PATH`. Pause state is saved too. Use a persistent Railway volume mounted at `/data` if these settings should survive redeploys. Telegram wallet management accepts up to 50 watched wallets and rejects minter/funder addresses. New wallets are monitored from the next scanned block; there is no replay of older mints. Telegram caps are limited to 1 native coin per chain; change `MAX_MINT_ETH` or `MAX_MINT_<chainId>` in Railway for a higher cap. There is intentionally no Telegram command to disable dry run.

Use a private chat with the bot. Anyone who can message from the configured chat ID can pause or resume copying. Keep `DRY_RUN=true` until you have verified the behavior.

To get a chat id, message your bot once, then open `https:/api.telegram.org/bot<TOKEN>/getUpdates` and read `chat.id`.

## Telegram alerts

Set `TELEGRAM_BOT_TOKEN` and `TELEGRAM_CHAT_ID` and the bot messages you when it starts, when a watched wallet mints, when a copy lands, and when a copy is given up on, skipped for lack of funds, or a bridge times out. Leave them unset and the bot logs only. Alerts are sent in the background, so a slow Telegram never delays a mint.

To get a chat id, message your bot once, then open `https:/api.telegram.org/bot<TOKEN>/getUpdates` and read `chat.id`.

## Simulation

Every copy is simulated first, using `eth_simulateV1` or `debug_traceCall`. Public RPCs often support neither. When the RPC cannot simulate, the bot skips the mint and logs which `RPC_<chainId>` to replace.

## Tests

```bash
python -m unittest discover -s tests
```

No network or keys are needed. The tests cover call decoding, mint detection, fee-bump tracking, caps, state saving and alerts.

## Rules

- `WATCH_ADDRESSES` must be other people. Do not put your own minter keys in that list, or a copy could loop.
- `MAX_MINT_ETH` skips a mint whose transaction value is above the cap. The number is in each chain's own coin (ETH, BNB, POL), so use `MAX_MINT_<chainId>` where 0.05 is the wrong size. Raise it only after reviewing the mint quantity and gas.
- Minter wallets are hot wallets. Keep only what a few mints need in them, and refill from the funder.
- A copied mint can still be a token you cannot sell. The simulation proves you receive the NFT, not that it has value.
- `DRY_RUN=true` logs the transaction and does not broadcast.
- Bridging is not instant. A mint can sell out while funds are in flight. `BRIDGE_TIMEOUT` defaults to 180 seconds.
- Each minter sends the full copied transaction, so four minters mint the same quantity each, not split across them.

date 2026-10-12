@@ -1,0 +1,1295 @@
+#!/usr/bin/env python3
+"""Watch wallets. When one mints an NFT to itself, mint the same quantity.
+
+The copy is the mint call only. Signature and allowlist calls are skipped.
+It is broadcast only when a simulation shows the minter receives the same
+collection and quantity. A send that does not land is retried, and the
+transaction is replaced once if it is still pending after two blocks.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+
+from eth_account import Account
+from eth_utils import keccak, to_checksum_address
+
+TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
+TRANSFER_SINGLE = "0x" + keccak(text="TransferSingle(address,address,address,uint256,uint256)").hex()
+TRANSFER_BATCH = "0x" + keccak(text="TransferBatch(address,address,address,uint256[],uint256[])").hex()
+ZERO_TOPIC = "0x" + "0" * 64
+LIFI = "https://li.quest/v1/quote"
+MAX_ATTEMPTS = 3
+LOG_CHUNK = 20
+MAX_WATCH = 50
+CAP_COMMAND_LIMIT = Decimal("1")
+
+
+def selector(signature):
+    return "0x" + keccak(text=signature).hex()[:8]
+
+
+MINT_OK = {
+    selector("mint(uint256)"),
+    selector("mint(address,uint256)"),
+    selector("mint(uint256,address)"),
+    selector("publicMint(uint256)"),
+    selector("mintPublic(address,address,address,uint256)"),
+    selector("claim(uint256)"),
+    selector("claim(address,uint256)"),
+    selector("purchase(uint256)"),
+}
+NON_MINT = {
+    selector("approve(address,uint256)"),
+    selector("transfer(address,uint256)"),
+    selector("transferFrom(address,address,uint256)"),
+    selector("setApprovalForAll(address,bool)"),
+    selector("deposit()"),
+    selector("withdraw(uint256)"),
+    selector("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))"),
+    selector("exactInput((bytes,address,uint256,uint256,uint256))"),
+    selector("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"),
+    selector("swapExactETHForTokens(uint256,address[],address,uint256)"),
+    selector("execute(bytes,bytes[],uint256)"),
+}
+MULTICALL = {
+    selector("multicall(bytes[])"),
+    selector("multicall(uint256,bytes[])"),
+    selector("aggregate((address,bytes)[])"),
+    selector("aggregate3((address,bool,bytes)[])"),
+    selector("tryAggregate(bool,(address,bytes)[])"),
+}
+
+# token address, decimals. Native is the zero address.
+STABLES = {
+    1: [("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6), ("0xdAC17F958D2ee523a2206206994597C13D831ec7", 6)],
+    10: [("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", 6), ("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58", 6)],
+    56: [("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", 18), ("0x55d398326f99059fF775485246999027B3197955", 18)],
+    137: [("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", 6), ("0xc2132D05D31c914a87C6611C10748AEb04B58e8F", 6)],
+    8453: [("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6)],
+    42161: [("0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6), ("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", 6)],
+    999: [("0xb88339CB7199b77E23DB6E890353E22632Ba630f", 6)],
+}
+
+CHAINS = {
+    1: ("Ethereum", "https://ethereum.publicnode.com"),
+    10: ("Optimism", "https://optimism.publicnode.com"),
+    56: ("BNB Chain", "https://bsc.publicnode.com"),
+    137: ("Polygon", "https://polygon-bor.publicnode.com"),
+    8453: ("Base", "https://base.publicnode.com"),
+    42161: ("Arbitrum", "https://arbitrum.publicnode.com"),
+    999: ("HyperEVM", "https://rpc.hyperliquid.xyz/evm"),
+    4663: ("Robinhood", "https://rpc.mainnet.chain.robinhood.com"),
+}
+
+
+def env(name, default=""):
+    return os.environ.get(name, default).strip().strip('"').strip("'")
+
+
+def flag(name, default="false"):
+    return env(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def notify(message):
+    """Send a Telegram message when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
+
+    Runs in a background thread so a slow Telegram never delays a mint, and
+    never raises. The failure log leaves out the URL because it holds the token.
+    """
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat = env("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+
+    def worker():
+        try:
+            body = urllib.parse.urlencode(
+                {"chat_id": chat, "text": message[:3900], "disable_web_page_preview": "true"}
+            ).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=body,
+                headers={"user-agent": "copymint-bot"},
+            )
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as exc:
+            log(f"telegram alert failed: {type(exc).__name__}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def alert(msg):
+    log(msg)
+    notify(msg)
+
+
+def telegram_call(method, params=None, timeout=35):
+    """Call the Telegram Bot API without logging the token-bearing URL."""
+    token = env("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=urllib.parse.urlencode(params or {}).encode(),
+        headers={"user-agent": "copymint-bot"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read())
+    if not payload.get("ok", False):
+        raise RuntimeError(f"Telegram API {method} failed")
+    return payload
+
+
+class SeenSet:
+    """A set that remembers insertion order, so the newest keys survive trimming."""
+
+    def __init__(self, items=()):
+        self._items = dict.fromkeys(items)
+
+    def add(self, key):
+        self._items[key] = None
+
+    def __contains__(self, key):
+        return key in self._items
+
+    def __len__(self):
+        return len(self._items)
+
+    def tail(self, count):
+        return list(self._items)[-count:]
+
+
+def as_int(value):
+    if isinstance(value, int):
+        return value
+    if value in (None, "0x", ""):
+        return 0
+    text = str(value)
+    return int(text, 16) if text.startswith("0x") else int(text)
+
+
+def word_int(body, index):
+    return int.from_bytes(body[index : index + 32], "big")
+
+
+def read_bytes(body, offset):
+    length = word_int(body, offset)
+    start = offset + 32
+    return body[start : start + length]
+
+
+def decode_bytes_array(body, start):
+    count = word_int(body, start)
+    items = []
+    for i in range(count):
+        relative = word_int(body, start + 32 + 32 * i)
+        # Offsets in a dynamic array are relative to the word after the length.
+        items.append(read_bytes(body, start + 32 + relative))
+    return items
+
+
+def decode_calls(body, start, with_bool=False):
+    count = word_int(body, start)
+    calls = []
+    for i in range(count):
+        relative = word_int(body, start + 32 + 32 * i)
+        # Offsets in a dynamic array are relative to the first offset word.
+        tuple_at = start + 32 + relative
+        target = "0x" + body[tuple_at + 12 : tuple_at + 32].hex()
+        head = tuple_at + 32
+        if with_bool:
+            head += 32
+        data = read_bytes(body, tuple_at + word_int(body, head))
+        calls.append((target, "0x" + data.hex()))
+    return calls
+
+
+def decode_multicall(data):
+    signature = data[:10].lower()
+    body = bytes.fromhex(data[10:])
+    if signature == selector("multicall(bytes[])"):
+        return [(None, "0x" + item.hex()) for item in decode_bytes_array(body, word_int(body, 0))]
+    if signature == selector("multicall(uint256,bytes[])"):
+        return [(None, "0x" + item.hex()) for item in decode_bytes_array(body, word_int(body, 32))]
+    if signature == selector("aggregate((address,bytes)[])"):
+        return decode_calls(body, word_int(body, 0), with_bool=False)
+    if signature == selector("aggregate3((address,bool,bytes)[])"):
+        return decode_calls(body, word_int(body, 0), with_bool=True)
+    if signature == selector("tryAggregate(bool,(address,bytes)[])"):
+        return decode_calls(body, word_int(body, 32), with_bool=False)
+    return []
+
+
+def expand_calls(target, data, value, depth=0):
+    signature = data[:10].lower() if len(data) >= 10 else ""
+    if depth < 3 and signature in MULTICALL:
+        try:
+            inners = decode_multicall(data)
+        except Exception:
+            inners = []
+        if inners:
+            found = []
+            for inner_target, inner_data in inners:
+                found.extend(expand_calls(inner_target or target, inner_data, value, depth + 1))
+            return found
+    return [(target, data, value)]
+
+
+def looks_signed(data):
+    if len(data) < 10:
+        return False
+    try:
+        body = bytes.fromhex(data[10:])
+    except ValueError:
+        return False
+    for index in range(0, max(0, len(body) - 96), 32):
+        if word_int(body, index) != 65:
+            continue
+        if index + 32 + 65 > len(body):
+            continue
+        if body[index + 32 + 64] in (0, 1, 27, 28):
+            return True
+    return False
+
+
+def single_qty(data):
+    if not data or len(data) < 2 + 128:
+        return 1
+    return int(data[2 + 64 : 2 + 128], 16)
+
+
+def batch_qty(data):
+    try:
+        body = bytes.fromhex(data[2:])
+        amounts_at = word_int(body, 32)
+        count = word_int(body, amounts_at)
+        total = 0
+        for i in range(count):
+            total += word_int(body, amounts_at + 32 + 32 * i)
+        return total
+    except Exception:
+        return 0
+
+
+def topic_address(topic):
+    return "0x" + topic[-40:]
+
+
+def collect_logs(node, found):
+    if isinstance(node, dict):
+        topics = node.get("topics")
+        address = node.get("address")
+        if isinstance(topics, list) and isinstance(address, str) and address.startswith("0x") and len(address) == 42 and "data" in node:
+            found.append(node)
+        for value in node.values():
+            collect_logs(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            collect_logs(value, found)
+
+
+def method_missing(exc):
+    text = str(exc).lower()
+    return "not found" in text or "not available" in text or "unsupported" in text or "32601" in text or "does not exist" in text
+
+
+@dataclass
+class Chain:
+    id: int
+    name: str
+    rpc: str
+
+
+class RPC:
+    def __init__(self, chains: dict[int, Chain]):
+        self.chains = chains
+
+    def call(self, chain_id, method, params, timeout=25):
+        url = self.chains[chain_id].rpc
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+            headers={"content-type": "application/json", "user-agent": "copymint-bot"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode()[:240]
+            raise RuntimeError(f"{method} {exc.code} {detail}") from exc
+        if body.get("error"):
+            raise RuntimeError(body["error"])
+        return body["result"]
+
+
+def load_keys(raw):
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.startswith("0x"):
+            part = "0x" + part
+        out.append(Account.from_key(part))
+    return out
+
+
+def to_wei(amount):
+    return int(Decimal(amount) * 10**18)
+
+
+def valid_address(text):
+    """Return a lower-case EVM address, or None if the input is malformed."""
+    text = text.strip()
+    if len(text) == 42 and text.startswith("0x") and all(
+        char in "0123456789abcdefABCDEF" for char in text[2:]
+    ):
+        return text.lower()
+    return None
+
+
+def short_address(address):
+    return address[:6] + "…" + address[-4:]
+
+
+def word(addr):
+    return addr[2:].lower().rjust(64, "0")
+
+
+def rewrite(data, old, new):
+    if old.lower() == new.lower():
+        return data
+    return "0x" + data[2:].lower().replace(word(old), word(new))
+
+
+class Bot:
+    def __init__(self):
+        watch = [to_checksum_address(a) for a in env("WATCH_ADDRESSES").split(",") if a.strip()]
+        if not watch:
+            raise SystemExit("Set WATCH_ADDRESSES")
+        self.watch = {a.lower() for a in watch}
+        self.minters = load_keys(env("MINTER_PRIVATE_KEYS"))
+        if not self.minters:
+            raise SystemExit("Set MINTER_PRIVATE_KEYS")
+        funder = env("FUNDER_PRIVATE_KEY")
+        self.funder = load_keys(funder)[0] if funder else None
+        self.own = {a.address.lower() for a in self.minters}
+        if self.funder:
+            self.own.add(self.funder.address.lower())
+
+        selected = [int(x) for x in env("CHAINS", "1,10,56,137,8453,42161,999,4663").split(",") if x.strip()]
+        chains = {}
+        for cid in selected:
+            if cid not in CHAINS:
+                raise SystemExit(f"Unknown chain id {cid}")
+            name, default = CHAINS[cid]
+            chains[cid] = Chain(cid, name, env(f"RPC_{cid}", default))
+        self.rpc = RPC(chains)
+        self.chains = chains
+        # Caps are in each chain's native coin (ETH, BNB, POL...). MAX_MINT_<chainId> overrides the default.
+        default_cap = env("MAX_MINT_ETH", "0.05")
+        self.max_values = {cid: to_wei(env(f"MAX_MINT_{cid}", default_cap)) for cid in chains}
+        self.allow_estimate = flag("ALLOW_ESTIMATE_FALLBACK")
+        self.bridge = flag("ENABLE_BRIDGE", "true")
+        self.bridge_timeout = int(env("BRIDGE_TIMEOUT", "180"))
+        self.poll = float(env("POLL_SECONDS", "0.4"))
+        self.dry = flag("DRY_RUN")
+        self.state_path = Path(env("STATE_PATH", "/data/state.json"))
+        if str(self.state_path).startswith("/data"):
+            try:
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.state_path = Path("state.json")
+                log("no /data volume, using ./state.json")
+        self.heads = {}
+        self.seen = SeenSet()
+        self.pending = {}
+        self.paused = False
+        self.cap_overrides = {}
+        self.watch_saved = False
+        self._state_lock = threading.Lock()
+        self._watch_lock = threading.RLock()
+        self._load()
+
+    def cap(self, chain_id):
+        return self.max_values[chain_id]
+
+    def _load(self):
+        if self.state_path.exists():
+            data = json.loads(self.state_path.read_text())
+            self.heads = {int(k): int(v) for k, v in (data.get("heads") or {}).items()}
+            self.seen = SeenSet(data.get("seen") or [])
+            self.pending = data.get("pending") or {}
+
+            self.paused = bool(data.get("paused", False))
+            saved_watch = data.get("watch")
+            if isinstance(saved_watch, list) and saved_watch:
+                # Re-validate persisted data before trusting it.
+                clean = {a.lower() for a in saved_watch if valid_address(str(a))}
+                clean.difference_update(self.own)
+                if clean:
+                    self.watch = clean
+                    self.watch_saved = True
+            for raw_cid, raw_value in (data.get("caps") or {}).items():
+                try:
+                    cid, value = int(raw_cid), int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if cid in self.max_values and value >= 0:
+                    self.max_values[cid] = value
+                    self.cap_overrides[cid] = value
+
+    def _save(self):
+        # Both the scanner and Telegram control loop can save state.
+        with self._state_lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(".tmp")
+            state = {
+                "heads": self.heads,
+                "seen": self.seen.tail(5000),
+                "pending": self.pending,
+                "paused": self.paused,
+            }
+            if self.watch_saved:
+                state["watch"] = sorted(self.watch)
+            if self.cap_overrides:
+                state["caps"] = {str(cid): str(value) for cid, value in self.cap_overrides.items()}
+            tmp.write_text(json.dumps(state))
+            tmp.replace(self.state_path)
+
+    def balance(self, chain_id, token, who):
+        if token == "native":
+            return int(self.rpc.call(chain_id, "eth_getBalance", [who, "latest"]), 16)
+        data = "0x70a08231" + word(who)
+        return int(self.rpc.call(chain_id, "eth_call", [{"to": token, "data": data}, "latest"]), 16)
+
+    def gas_price(self, chain_id):
+        return int(self.rpc.call(chain_id, "eth_gasPrice", []), 16)
+
+    def fees(self, chain_id):
+        try:
+            hist = self.rpc.call(chain_id, "eth_feeHistory", ["0x5", "latest", [50]])
+            base = as_int(hist["baseFeePerGas"][-1])
+            tips = []
+            for row in hist.get("reward") or []:
+                if row and row[0] not in (None, "0x"):
+                    tips.append(as_int(row[0]))
+            tip = max(tips) if tips else max(base // 10, 1)
+        except Exception:
+            base = self.gas_price(chain_id)
+            tip = max(base // 10, 1)
+        if tip < 1:
+            tip = 1
+        return base * 2 + tip, min(tip, base * 2 + tip)
+
+    def send(self, chain_id, acct, to, data="0x", value=0, gas=None, fee=None, tip=None, nonce=None, wait=True):
+        if self.dry:
+            log(f"DRY {acct.address} {self.chains[chain_id].name} to {to} value {value} gas {gas if gas is not None else 'auto'}")
+            return "dry", True
+        if fee is None or tip is None:
+            fee, tip = self.fees(chain_id)
+        if gas is None:
+            est = int(
+                self.rpc.call(
+                    chain_id,
+                    "eth_estimateGas",
+                    [{"from": acct.address, "to": to, "data": data, "value": hex(value)}],
+                ),
+                16,
+            )
+            gas = int(est * 1.3) + 20_000
+        have = self.balance(chain_id, "native", acct.address)
+        cost = value + gas * fee
+        if have < cost:
+            raise RuntimeError(f"short {have} < {cost}")
+        if self.dry:
+            log(f"DRY {acct.address[:8]} {self.chains[chain_id].name} value {value} gas {gas}")
+            return "dry", True
+        if nonce is None:
+            nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+        signed = acct.sign_transaction(
+            {
+                "chainId": chain_id,
+                "nonce": nonce,
+                "gas": gas,
+                "maxFeePerGas": fee,
+                "maxPriorityFeePerGas": tip,
+                "to": to_checksum_address(to),
+                "value": value,
+                "data": data,
+                "type": 2,
+            }
+        )
+        txh = self.rpc.call(chain_id, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+        if not wait:
+            return txh, False
+        for _ in range(40):
+            rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+            if rec:
+                return txh, int(rec["status"], 16) == 1
+            time.sleep(0.5)
+        return txh, False
+
+    def land(self, chain_id, acct, to, data, value, gas):
+        if self.dry:
+            txh, ok = self.send(chain_id, acct, to, data, value, gas)
+            return txh, ok, [txh]
+        fee, tip = self.fees(chain_id)
+        nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+        start = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+        txh, ok = self.send(chain_id, acct, to, data, value, gas, fee, tip, nonce, wait=False)
+        if self.dry:
+            return txh, True, [txh]
+        # Keep every hash sent for this nonce. Either the original or the
+        # replacement can land, so both have to be watched for a receipt.
+        sent = [txh]
+        bumped = False
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            hit = self.receipt_for(chain_id, sent)
+            if hit:
+                return hit[0], hit[1], sent
+            now = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+            if not bumped and now >= start + 2:
+                bumped = True
+                new_fee = max(int(fee * 2), fee + 1)
+                new_tip = min(max(int(tip * 2), tip + 1), new_fee)
+                try:
+                    new_hash, _ = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
+                    sent.append(new_hash)
+                    log(f"replaced {acct.address[:8]} {new_hash}")
+                except Exception as exc:
+                    if "nonce" not in str(exc).lower():
+                        log(f"replace {acct.address[:8]} {exc}")
+            time.sleep(0.6)
+        return sent[-1], False, sent
+
+    def receipt_for(self, chain_id, hashes):
+        """Return (hash, success) for the first hash that has a receipt, else None."""
+        for txh in hashes:
+            rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+            if rec:
+                return txh, int(rec["status"], 16) == 1
+        return None
+
+    def lifi_quote(self, src, dst, token, amount, sender, recipient):
+        qs = urllib.parse.urlencode(
+            {
+                "fromChain": str(src),
+                "toChain": str(dst),
+                "fromToken": "0x0000000000000000000000000000000000000000" if token == "native" else token,
+                "toToken": "0x0000000000000000000000000000000000000000",
+                "fromAmount": str(amount),
+                "fromAddress": sender,
+                "toAddress": recipient,
+                "slippage": "0.03",
+            }
+        )
+        req = urllib.request.Request(LIFI + "?" + qs, headers={"accept": "application/json", "user-agent": "copymint-bot"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    def sized_quote(self, src, dst, token, decimals, available, sender, recipient, need):
+        reserve = 0 if token != "native" else 300_000 * max(self.gas_price(src), 1) * 3
+        spendable = available - reserve
+        if spendable <= 0:
+            return None
+        probe = max(spendable // 8, 10**decimals // 1000)
+        probe = min(probe, spendable)
+        try:
+            quote = self.lifi_quote(src, dst, token, probe, sender, recipient)
+        except Exception as exc:
+            log(f"quote {src}->{dst} {exc}")
+            return None
+        out = int((quote.get("estimate") or {}).get("toAmount") or 0)
+        if out <= 0:
+            return None
+        if out >= need and probe > 0:
+            scaled = int(probe * need / out * 1.2) + 1
+            scaled = min(max(scaled, 10**decimals // 1000), spendable)
+            try:
+                quote = self.lifi_quote(src, dst, token, scaled, sender, recipient)
+                out = int((quote.get("estimate") or {}).get("toAmount") or 0)
+            except Exception as exc:
+                log(f"sized quote {exc}")
+                return None
+        if out < need:
+            return None
+        return quote
+
+    def execute_quote(self, chain_id, acct, quote, token):
+        approval = (quote.get("estimate") or {}).get("approvalAddress")
+        amount = int((quote.get("action") or {}).get("fromAmount") or (quote.get("estimate") or {}).get("fromAmount") or 0)
+        if approval and token != "native" and amount:
+            allowance = int(
+                self.rpc.call(
+                    chain_id,
+                    "eth_call",
+                    [{"to": token, "data": "0xdd62ed3e" + word(acct.address) + word(approval)}, "latest"],
+                ),
+                16,
+            )
+            if allowance < amount:
+                data = "0x095ea7b3" + word(approval) + hex(amount)[2:].rjust(64, "0")
+                txh, ok = self.send(chain_id, acct, token, data, 0)
+                log(f"approve {'OK' if ok else 'FAIL'} {txh}")
+                if not ok:
+                    return False
+        tx = quote.get("transactionRequest") or {}
+        if not tx.get("to") or not tx.get("data"):
+            return False
+        value = as_int(tx.get("value") or 0)
+        gas = as_int(tx.get("gasLimit") or tx.get("gas") or 0)
+        txh, ok = self.send(chain_id, acct, tx["to"], tx["data"], value, int(gas * 1.2) if gas else None)
+        log(f"bridge {'OK' if ok else 'FAIL'} {txh}")
+        return ok
+
+    def holdings(self, holder):
+        """Every non-zero native and stablecoin balance a wallet has, read in parallel."""
+        jobs = []
+        for src in self.chains:
+            jobs.append((src, "native", 18))
+            for token, decimals in STABLES.get(src, []):
+                jobs.append((src, token, decimals))
+
+        def fetch(job):
+            src, token, decimals = job
+            try:
+                return src, token, decimals, self.balance(src, token, holder.address)
+            except Exception as exc:
+                log(f"balance {self.chains[src].name} {exc}")
+                return src, token, decimals, 0
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(fetch, jobs))
+        return [row for row in rows if row[3] > 0]
+
+    def ensure(self, minter, chain_id, need):
+        current = self.balance(chain_id, "native", minter.address)
+        if self.dry:
+            if current < need:
+                log(f"DRY {minter.address[:8]} short {(need - current) / 1e18:.6f} on {self.chains[chain_id].name}, not bridging")
+            return True
+        if current >= need:
+            return True
+        if not self.bridge:
+            return False
+        short = need - current
+        holders = [minter]
+        if self.funder and self.funder.address.lower() != minter.address.lower():
+            holders.append(self.funder)
+        for holder in holders:
+            for src, token, decimals, have in self.holdings(holder):
+                if src == chain_id and token == "native":
+                    continue
+                quote = self.sized_quote(src, chain_id, token, decimals, have, holder.address, minter.address, short)
+                if not quote:
+                    continue
+                label = "native" if token == "native" else token[:8]
+                log(f"funding {minter.address[:8]} from {self.chains[src].name} {label}")
+                if not self.execute_quote(src, holder, quote, token):
+                    continue
+                deadline = time.time() + self.bridge_timeout
+                while time.time() < deadline:
+                    if self.balance(chain_id, "native", minter.address) >= need:
+                        return True
+                    time.sleep(3)
+                alert(f"bridge timed out for {minter.address[:8]} on {self.chains[chain_id].name}")
+        return self.balance(chain_id, "native", minter.address) >= need
+
+    def rewrite_watched(self, data, new):
+        for old in self.watch:
+            data = rewrite(data, old, new)
+        return data
+
+    def minted_map(self, logs):
+        totals = {}
+        for entry in logs:
+            topics = [t.lower() for t in entry.get("topics") or []]
+            collection = entry.get("address", "").lower()
+            qty = 0
+            if len(topics) >= 3 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
+                if topic_address(topics[2]) in self.watch:
+                    qty = 1
+            elif len(topics) >= 4 and topics[0] == TRANSFER_SINGLE and topics[2] == ZERO_TOPIC:
+                if topic_address(topics[3]) in self.watch:
+                    qty = single_qty(entry.get("data") or "0x")
+            elif len(topics) >= 4 and topics[0] == TRANSFER_BATCH and topics[2] == ZERO_TOPIC:
+                if topic_address(topics[3]) in self.watch:
+                    qty = batch_qty(entry.get("data") or "0x")
+            if qty > 0 and collection:
+                totals[collection] = totals.get(collection, 0) + qty
+        return totals
+
+    def minted_for(self, logs, recipient):
+        recip = recipient.lower()
+        totals = {}
+        saved = self.watch
+        self.watch = {recip}
+        try:
+            totals = self.minted_map(logs)
+        finally:
+            self.watch = saved
+        return totals
+
+    def simulate(self, chain_id, acct, target, data, value):
+        call = {
+            "from": acct.address,
+            "to": to_checksum_address(target),
+            "data": data,
+            "value": hex(value),
+            "gas": hex(1_500_000),
+        }
+        try:
+            result = self.rpc.call(
+                chain_id,
+                "eth_simulateV1",
+                [{"blockStateCalls": [{"calls": [call]}], "validation": False, "traceTransfers": True}, "latest"],
+            )
+            status = 1
+            gas_used = 0
+            if isinstance(result, list) and result and isinstance(result[0], dict):
+                calls = result[0].get("calls") or []
+                if calls:
+                    if calls[0].get("error"):
+                        status = 0
+                    elif calls[0].get("status") is not None:
+                        status = as_int(calls[0].get("status"))
+                    gas_used = as_int(calls[0].get("gasUsed"))
+            if status == 0:
+                return None
+            logs = []
+            collect_logs(result, logs)
+            return logs, gas_used or 400_000
+        except Exception as exc:
+            if not method_missing(exc):
+                text = str(exc).lower()
+                if "revert" in text or "execution" in text:
+                    return None
+                if not method_missing(exc):
+                    log(f"simulate {exc}")
+                    return None
+        try:
+            result = self.rpc.call(
+                chain_id,
+                "debug_traceCall",
+                [call, "latest", {"tracer": "callTracer", "tracerConfig": {"withLog": True}}],
+            )
+        except Exception as exc:
+            if method_missing(exc):
+                return "unsupported"
+            if "revert" in str(exc).lower():
+                return None
+            return "unsupported"
+        if isinstance(result, dict) and result.get("error"):
+            return None
+        logs = []
+        collect_logs(result, logs)
+        gas_used = as_int(result.get("gasUsed")) if isinstance(result, dict) else 0
+        if not logs:
+            return "unsupported"
+        return logs, gas_used or 400_000
+
+    def candidates(self, tx):
+        calls = expand_calls(tx["to"], tx.get("input") or "0x", int(tx.get("value") or "0", 16))
+        kept = []
+        for target, data, value in calls:
+            if len(data) < 10:
+                continue
+            if data[:10].lower() in NON_MINT or looks_signed(data):
+                continue
+            kept.append((target, data, value))
+        return kept
+
+    def fallback(self, chain_id, acct, options, want):
+        simple = []
+        for target, data, value in options:
+            signature = data[:10].lower()
+            if signature in MINT_OK or target.lower() in want:
+                simple.append((target, self.rewrite_watched(data, acct.address), value))
+        if len(simple) != 1:
+            return None
+        target, data, value = simple[0]
+        if value > self.cap(chain_id):
+            value = 0
+        try:
+            est = int(
+                self.rpc.call(
+                    chain_id,
+                    "eth_estimateGas",
+                    [{"from": acct.address, "to": target, "data": data, "value": hex(value)}],
+                ),
+                16,
+            )
+        except Exception:
+            return None
+        log(f"{acct.address[:8]} RPC cannot show mint logs, using the gas estimate")
+        return value, target, data, est
+
+    def pick(self, chain_id, acct, options, want):
+        saw_real = False
+        unsupported = False
+        best = None
+        for target, raw, hinted in options:
+            data = self.rewrite_watched(raw, acct.address)
+            values = []
+            for value in (0, hinted):
+                if value not in values and value <= self.cap(chain_id):
+                    values.append(value)
+            for value in values:
+                result = self.simulate(chain_id, acct, target, data, value)
+                if result == "unsupported":
+                    unsupported = True
+                    continue
+                saw_real = True
+                if not result:
+                    continue
+                logs, gas_used = result
+                if self.minted_for(logs, acct.address) != want:
+                    continue
+                if best is None or value < best[0]:
+                    best = (value, target, data, max(gas_used, 80_000))
+                break
+        if best:
+            return best
+        if not saw_real and unsupported:
+            if self.allow_estimate:
+                return self.fallback(chain_id, acct, options, want)
+            log(
+                f"{self.chains[chain_id].name} RPC cannot simulate, skipping. "
+                f"Set RPC_{chain_id} to a node with eth_simulateV1 or debug_traceCall, "
+                "or set ALLOW_ESTIMATE_FALLBACK=true to send on a gas estimate alone."
+            )
+        return None
+
+    def copy(self, chain_id, tx, want):
+        key = f"{chain_id}:{tx['hash']}"
+        if key in self.seen:
+            return
+        item = self.pending.get(key) or {
+            "chain": chain_id,
+            "hash": tx["hash"],
+            "from": tx["from"],
+            "to": tx["to"],
+            "input": tx.get("input") or "0x",
+            "value": int(tx.get("value") or "0", 16),
+            "want": want,
+            "attempts": 0,
+            "done": [],
+            "inflight": {},
+        }
+        options = self.candidates(tx)
+        chain = self.chains[chain_id]
+        qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
+        if item["attempts"] == 0:
+            alert(f"mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
+        if not options:
+            log(f"skip {tx['hash']} no mint call")
+            self.seen.add(key)
+            self.pending.pop(key, None)
+            self._save()
+            return
+        item["attempts"] = int(item.get("attempts") or 0) + 1
+        temporary = False
+        done = set(a.lower() for a in item.get("done") or [])
+        inflight = item.get("inflight") or {}
+        for acct in self.minters:
+            who = acct.address.lower()
+            if who in done:
+                continue
+            previous = inflight.get(who)
+            if previous:
+                # Older state files hold one hash as a string, newer ones a list.
+                hashes = [previous] if isinstance(previous, str) else list(previous)
+                hit = self.receipt_for(chain_id, hashes)
+                if hit is None:
+                    temporary = True
+                    continue
+                inflight.pop(who, None)
+                if hit[1]:
+                    done.add(who)
+                    alert(f"OK {acct.address} {hit[0]}")
+                    continue
+            chosen = self.pick(chain_id, acct, options, want)
+            if not chosen:
+                log(f"skip {acct.address[:8]} simulation does not match {qty}")
+                continue
+            value, target, data, gas_used = chosen
+            gas = int(gas_used * 1.25) + 20_000
+            fee, _tip = self.fees(chain_id)
+            if not self.ensure(acct, chain_id, value + gas * fee):
+                alert(f"skip {acct.address[:8]} not enough on {chain.name} and no route")
+                temporary = True
+                continue
+            try:
+                txh, ok, sent = self.land(chain_id, acct, target, data, value, gas)
+            except Exception as exc:
+                log(f"send {acct.address[:8]} {exc}")
+                temporary = True
+                continue
+            if ok:
+                done.add(who)
+                if self.dry:
+                    alert(f"DRY {acct.address} would mint on {chain.name}, not broadcast")
+                else:
+                    alert(f"OK {acct.address} {txh}")
+            else:
+                inflight[who] = sent
+                temporary = True
+                log(f"pending {acct.address} {txh}")
+        item["done"] = sorted(done)
+        item["inflight"] = inflight
+        if len(done) == len(self.minters) or not temporary:
+            self.seen.add(key)
+            self.pending.pop(key, None)
+        elif item["attempts"] >= MAX_ATTEMPTS:
+            alert(f"giving up {tx['hash']} after {item['attempts']} attempts")
+            self.seen.add(key)
+            self.pending.pop(key, None)
+        else:
+            self.pending[key] = item
+        self._save()
+
+    def balances_text(self):
+        accounts = list(self.minters) + ([self.funder] if self.funder else [])
+        jobs = [(index, cid) for index in range(len(accounts)) for cid in self.chains]
+
+        def fetch(job):
+            index, cid = job
+            try:
+                return index, cid, self.balance(cid, "native", accounts[index].address)
+            except Exception:
+                return index, cid, None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(fetch, jobs))
+        lines = []
+        for index, account in enumerate(accounts):
+            label = "funder" if self.funder is not None and account is self.funder else "minter"
+            lines.append(f"{label} {short_address(account.address)}")
+            for row_index, cid, balance in rows:
+                if row_index == index:
+                    amount = "n/a" if balance is None else f"{balance / 1e18:.4f}"
+                    lines.append(f"  {self.chains[cid].name}: {amount}")
+        return "\n".join(lines) or "No minter or funder wallets configured."
+
+    def wallets_text(self):
+        wallets = sorted(self.watch)
+        source = "saved list" if self.watch_saved else "WATCH_ADDRESSES"
+        return f"Watching {len(wallets)} wallet(s) ({source}):\n" + "\n".join(
+            to_checksum_address(address) for address in wallets
+        )
+
+    def watch_command(self, args):
+        if not args:
+            return "Usage: /watch 0xADDRESS [0xADDRESS ...]"
+        updated = set(self.watch)
+        lines = []
+        for raw in args:
+            address = valid_address(raw)
+            if address is None:
+                lines.append(f"{raw[:12]}: invalid EVM address")
+            elif address in self.own:
+                lines.append(f"{short_address(address)}: one of your own wallets; not added")
+            elif address in updated:
+                lines.append(f"{short_address(address)}: already watched")
+            elif len(updated) >= MAX_WATCH:
+                lines.append(f"{short_address(address)}: limit of {MAX_WATCH} watched wallets reached")
+            else:
+                updated.add(address)
+                lines.append(f"{short_address(address)}: added")
+        if updated != self.watch:
+            with self._watch_lock:
+                self.watch = updated
+            self.watch_saved = True
+            self._save()
+            lines.append("Changes take effect from the next scanned block; old mints are not replayed.")
+        return "\n".join(lines)
+
+    def unwatch_command(self, args):
+        if not args:
+            return "Usage: /unwatch 0xADDRESS [0xADDRESS ...]"
+        updated = set(self.watch)
+        lines = []
+        for raw in args:
+            address = valid_address(raw)
+            if address is None:
+                lines.append(f"{raw[:12]}: invalid EVM address")
+            elif address not in updated:
+                lines.append(f"{short_address(address)}: not currently watched")
+            elif len(updated) <= 1:
+                lines.append(f"{short_address(address)}: cannot remove the last watched wallet; use /off")
+            else:
+                updated.remove(address)
+                lines.append(f"{short_address(address)}: removed")
+        if updated != self.watch:
+            with self._watch_lock:
+                self.watch = updated
+            self.watch_saved = True
+            self._save()
+        return "\n".join(lines)
+
+    def cap_command(self, args):
+        if not args:
+            rows = [f"{chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
+            return (
+                "Mint value caps in each chain's native coin:\n" + "\n".join(rows)
+                + "\nSet one: /cap 56 0.1 | Set all: /cap all 0.05"
+            )
+        if len(args) != 2:
+            return "Usage: /cap CHAIN_ID AMOUNT or /cap all AMOUNT"
+        target, amount_text = args
+        try:
+            amount = Decimal(amount_text)
+        except Exception:
+            return "Amount must be a number."
+        if not amount.is_finite() or amount < 0 or amount > CAP_COMMAND_LIMIT:
+            return f"Amount must be between 0 and {CAP_COMMAND_LIMIT}. For a higher cap, edit MAX_MINT_ETH or MAX_MINT_<chainId>."
+        if target.lower() == "all":
+            chain_ids = list(self.chains)
+        else:
+            try:
+                cid = int(target)
+            except ValueError:
+                return "Chain ID must be an integer or 'all'."
+            if cid not in self.chains:
+                return f"Chain {cid} is not enabled."
+            chain_ids = [cid]
+        value = to_wei(amount_text)
+        for cid in chain_ids:
+            self.max_values[cid] = value
+            self.cap_overrides[cid] = value
+        self._save()
+        return f"Cap set to {amount_text} on " + ", ".join(self.chains[cid].name for cid in chain_ids)
+
+    def command_reply(self, command, args=()):
+        if command == "/status":
+            names = ", ".join(chain.name for chain in self.chains.values())
+            return (
+                f"copymint is {'PAUSED' if self.paused else 'ON'}\n"
+                f"dry run: {'on' if self.dry else 'off'}\nchains: {names}\n"
+                f"watching {len(self.watch)} wallet(s), {len(self.minters)} minter(s)\n"
+                f"copies waiting to retry: {len(self.pending)}"
+            )
+        if command == "/off":
+            self.paused = True
+            for key in list(self.pending):
+                self.seen.add(key)
+            self.pending.clear()
+            self._save()
+            return "Paused. New mints will be skipped, and pending retries have been dropped. Use /on to resume."
+        if command == "/on":
+            self.paused = False
+            self._save()
+            return "Resumed. Only mints seen from now on will be copied; paused mints are not replayed."
+        if command == "/wallets":
+            return self.wallets_text()
+        if command == "/watch":
+            return self.watch_command(args)
+        if command == "/unwatch":
+            return self.unwatch_command(args)
+        if command == "/minters":
+            lines = [f"minter {account.address}" for account in self.minters]
+            if self.funder:
+                lines.append(f"funder {self.funder.address}")
+            return "\n".join(lines)
+        if command == "/balance":
+            return self.balances_text()
+        if command == "/cap":
+            return self.cap_command(args)
+        if command in ("/help", "/start"):
+            return (
+                "Commands:\n/status\n/off\n/on\n/wallets\n/watch 0xADDRESS\n"
+                "/unwatch 0xADDRESS\n/minters\n/balance\n/cap [CHAIN_ID AMOUNT]"
+            )
+        return None
+
+    def handle_command(self, update, chat_id):
+        message = update.get("message") or {}
+        if str((message.get("chat") or {}).get("id")) != str(chat_id):
+            return
+        parts = (message.get("text") or "").strip().split()
+        if not parts:
+            return
+        reply = self.command_reply(parts[0].split("@")[0].lower(), parts[1:])
+        if reply:
+            log(f"telegram command {parts[0].split('@')[0]}")
+            notify(reply)
+
+    def control_loop(self):
+        chat_id = env("TELEGRAM_CHAT_ID")
+        offset = None
+        try:
+            # Ignore commands sent before this process started.
+            first = telegram_call("getUpdates", {"offset": -1, "timeout": 0}, timeout=15)
+            updates = first.get("result") or []
+            if updates:
+                offset = updates[-1]["update_id"] + 1
+        except Exception as exc:
+            log(f"telegram command startup failed: {type(exc).__name__}")
+        while True:
+            try:
+                params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
+                if offset is not None:
+                    params["offset"] = offset
+                for update in telegram_call("getUpdates", params).get("result") or []:
+                    offset = update["update_id"] + 1
+                    self.handle_command(update, chat_id)
+            except Exception as exc:
+                log(f"telegram command polling failed: {type(exc).__name__}")
+                time.sleep(10)
+
+    def logs_for(self, chain_id, start, end):
+        with self._watch_lock:
+            watched_addresses = list(self.watch)
+        watched = ["0x" + word(addr) for addr in watched_addresses]
+        queries = [
+            [TRANSFER, ZERO_TOPIC, watched],
+            [TRANSFER_SINGLE, None, ZERO_TOPIC, watched],
+            [TRANSFER_BATCH, None, ZERO_TOPIC, watched],
+        ]
+        found = []
+        for topics in queries:
+            found.extend(
+                self.rpc.call(
+                    chain_id,
+                    "eth_getLogs",
+                    [{"fromBlock": hex(start), "toBlock": hex(end), "topics": topics}],
+                )
+                or []
+            )
+        return found
+
+    def take_range(self, chain_id, start, end):
+        try:
+            entries = self.logs_for(chain_id, start, end)
+        except Exception as exc:
+            if start == end:
+                log(f"{self.chains[chain_id].name} skip block {start} {exc}")
+                return end
+            mid = (start + end) // 2
+            reached = self.take_range(chain_id, start, mid)
+            if reached < mid:
+                return reached
+            return self.take_range(chain_id, mid + 1, end)
+        grouped = {}
+        for entry in entries:
+            grouped.setdefault(entry["transactionHash"], []).append(entry)
+        ordered = sorted(grouped.items(), key=lambda item: (as_int(item[1][0].get("blockNumber")), as_int(item[1][0].get("transactionIndex"))))
+        for txh, logs in ordered:
+            want = self.minted_map(logs)
+            if not want:
+                continue
+            if f"{chain_id}:{txh}" in self.seen:
+                continue
+            try:
+                tx = self.rpc.call(chain_id, "eth_getTransactionByHash", [txh])
+            except Exception as exc:
+                log(f"tx {txh} {exc}")
+                continue
+            if not tx or not tx.get("to"):
+                continue
+            sender = (tx.get("from") or "").lower()
+            if sender not in self.watch or sender in self.own:
+                continue
+            if int(tx.get("value") or "0", 16) > self.cap(chain_id):
+                log(f"skip {txh} value {int(tx.get('value'), 16) / 1e18:.4f} over cap")
+                self.seen.add(f"{chain_id}:{txh}")
+                self._save()
+                continue
+            if self.paused:
+                self.seen.add(f"{chain_id}:{txh}")
+                self._save()
+                alert(f"paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
+                continue
+            try:
+                self.copy(chain_id, tx, want)
+            except Exception as exc:
+                log(f"tx {txh} {exc}")
+        return end
+
+    def scan(self, chain_id):
+        head = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+        last = self.heads.get(chain_id)
+        if last is None:
+            self.heads[chain_id] = head
+            self._save()
+            log(f"{self.chains[chain_id].name} watching from {head}")
+            return
+        if head < last:
+            last = head - 1
+        if head <= last:
+            return
+        cursor = last + 1
+        while cursor <= head:
+            end = min(head, cursor + LOG_CHUNK - 1)
+            reached = self.take_range(chain_id, cursor, end)
+            self.heads[chain_id] = reached
+            self._save()
+            if reached < end:
+                break
+            cursor = reached + 1
+
+    def retry_pending(self):
+        if self.paused:
+            return
+        for key, item in list(self.pending.items()):
+            chain_id = int(item["chain"])
+            if chain_id not in self.chains:
+                continue
+            tx = {
+                "hash": item["hash"],
+                "from": item["from"],
+                "to": item["to"],
+                "input": item["input"],
+                "value": hex(int(item["value"])),
+            }
+            try:
+                self.copy(chain_id, tx, {k.lower(): int(v) for k, v in item["want"].items()})
+            except Exception as exc:
+                log(f"retry {item['hash']} {exc}")
+
+    def run(self):
+        names = ", ".join(c.name for c in self.chains.values())
+        log(f"watching {len(self.watch)} wallet(s) on {names}")
+        log(f"minters {', '.join(a.address for a in self.minters)}")
+        if self.funder:
+            log(f"funder {self.funder.address}")
+        log(f"bridge {'on' if self.bridge else 'off'} dry {'on' if self.dry else 'off'}")
+        notify(
+            f"copymint-bot started ({'PAUSED' if self.paused else 'on'}): {len(self.watch)} wallet(s) on {names}, "
+            f"dry run {'on' if self.dry else 'off'}"
+        )
+        if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
+            threading.Thread(target=self.control_loop, daemon=True).start()
+            log("telegram controls enabled")
+        while True:
+            for cid in self.chains:
+                try:
+                    self.scan(cid)
+                except Exception as exc:
+                    log(f"{self.chains[cid].name} {exc}")
+            try:
+                self.retry_pending()
+            except Exception as exc:
+                log(f"retry {exc}")
+            time.sleep(self.poll)
+
+
+if __name__ == "__main__":
+    Bot().run()
