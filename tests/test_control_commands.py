@@ -92,6 +92,18 @@ class WalletCommands(unittest.TestCase):
         self.assertIn("added", notify.call_args[0][0])
 
 
+class WatchListSetting(unittest.TestCase):
+    def test_spaces_and_new_lines_between_addresses_are_fine(self):
+        a, b, c = ("0x" + x * 20 for x in ("12", "34", "56"))
+        for raw in (f"{a}, {b}, {c}", f"{a},{b},{c}", f"{a}\n{b}\n{c}", f" {a} ,{b};  {c} "):
+            self.assertEqual(make_bot(WATCH_ADDRESSES=raw).watch, {a, b, c}, raw)
+
+    def test_a_bad_address_stops_the_bot_with_a_clear_message(self):
+        with self.assertRaises(SystemExit) as caught:
+            make_bot(WATCH_ADDRESSES=f"{WATCHED}, 0x123")
+        self.assertIn("invalid address", str(caught.exception))
+
+
 class PauseAndOtherCommands(unittest.TestCase):
     def test_pause_survives_a_restart(self):
         b = make_bot()

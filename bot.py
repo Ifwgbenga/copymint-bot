@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -431,7 +432,15 @@ def rewrite(data, old, new):
 
 class Bot:
     def __init__(self):
-        watch = [to_checksum_address(a) for a in env("WATCH_ADDRESSES").split(",") if a.strip()]
+        # Commas, spaces and new lines all separate addresses, so "0xA, 0xB" works.
+        watch = []
+        for part in re.split(r"[,;\s]+", env("WATCH_ADDRESSES")):
+            if not part:
+                continue
+            address = valid_address(part)
+            if address is None:
+                raise SystemExit(f"WATCH_ADDRESSES has an invalid address: {part[:12]}...")
+            watch.append(address)
         if not watch:
             raise SystemExit("Set WATCH_ADDRESSES")
         self.watch = {a.lower() for a in watch}
