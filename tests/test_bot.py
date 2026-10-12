@@ -246,7 +246,29 @@ class Picking(unittest.TestCase):
         self.assertEqual(calls, [0])
 
 
-class Alerts(unittest.TestCase):
+class DryRun(unittest.TestCase):
+    def test_true_values(self):
+        for value in ("true", "TRUE", " yes ", '"true"'):
+            self.assertTrue(make_bot(DRY_RUN=value).dry, value)
+        self.assertFalse(make_bot().dry)
+        self.assertFalse(make_bot(DRY_RUN="false").dry)
+
+    def test_send_and_land_do_not_touch_the_rpc(self):
+        b = make_bot(DRY_RUN="true")
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = AssertionError("broadcast")
+        txh, ok = b.send(1, b.minters[0], COLLECTION, "0x", 0, 100_000)
+        self.assertEqual((txh, ok), ("dry", True))
+        txh, ok, sent = b.land(1, b.minters[0], COLLECTION, "0x", 0, 100_000)
+        self.assertEqual((txh, ok, sent), ("dry", True, ["dry"]))
+        b.rpc.call.assert_not_called()
+
+    def test_short_wallet_does_not_bridge(self):
+        b = make_bot(DRY_RUN="true")
+        b.balance = lambda chain_id, token, who: 0
+        b.holdings = mock.Mock(side_effect=AssertionError("bridge"))
+        self.assertTrue(b.ensure(b.minters[0], 1, 10**16))
+        b.holdings.assert_not_called()
     class InlineThread:
         def __init__(self, target, daemon=None):
             self.target = target

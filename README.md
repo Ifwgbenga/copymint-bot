@@ -54,10 +54,15 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
 | `TELEGRAM_CHAT_ID` | optional, the chat that receives alerts |
 | `ALLOW_ESTIMATE_FALLBACK` | `false` by default, see Simulation below |
+| `DRY_RUN` | `true` while testing. Delete it or set `false` to broadcast |
 | `STATE_PATH` | `/data/state.json` |
 
 3. Settings → add a Volume, mount path `/data`. That keeps the last processed block across restarts. Without it, a restart can miss mints that happened while it was down.
 4. The start command is `python bot.py`. Redeploy.
+
+## Dry run
+
+On Railway: add `DRY_RUN` = `true` under Variables, then redeploy. Startup logs `dry on`. A watched mint is simulated and logged, and nothing is broadcast or bridged. When you're ready to go live, change it to `false` or delete it, then redeploy. Startup should log `dry off`.
 
 Public RPCs are filled in for any `RPC_<chainId>` you leave empty. They rate-limit. Set Alchemy or an equivalent URL for any chain you really care about.
 

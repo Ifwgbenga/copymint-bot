@@ -92,7 +92,11 @@ CHAINS = {
 
 
 def env(name, default=""):
-    return os.environ.get(name, default).strip()
+    return os.environ.get(name, default).strip().strip('"').strip("'")
+
+
+def flag(name, default="false"):
+    return env(name, default).lower() in ("1", "true", "yes", "on")
 
 
 def log(msg):
@@ -367,11 +371,11 @@ class Bot:
         # Caps are in each chain's native coin (ETH, BNB, POL...). MAX_MINT_<chainId> overrides the default.
         default_cap = env("MAX_MINT_ETH", "0.05")
         self.max_values = {cid: to_wei(env(f"MAX_MINT_{cid}", default_cap)) for cid in chains}
-        self.allow_estimate = env("ALLOW_ESTIMATE_FALLBACK", "false").lower() in ("1", "true", "yes")
-        self.bridge = env("ENABLE_BRIDGE", "true").lower() in ("1", "true", "yes")
+        self.allow_estimate = flag("ALLOW_ESTIMATE_FALLBACK")
+        self.bridge = flag("ENABLE_BRIDGE", "true")
         self.bridge_timeout = int(env("BRIDGE_TIMEOUT", "180"))
         self.poll = float(env("POLL_SECONDS", "0.4"))
-        self.dry = env("DRY_RUN", "false").lower() in ("1", "true", "yes")
+        self.dry = flag("DRY_RUN")
         self.state_path = Path(env("STATE_PATH", "/data/state.json"))
         if str(self.state_path).startswith("/data"):
             try:
@@ -426,6 +430,9 @@ class Bot:
         return base * 2 + tip, min(tip, base * 2 + tip)
 
     def send(self, chain_id, acct, to, data="0x", value=0, gas=None, fee=None, tip=None, nonce=None, wait=True):
+        if self.dry:
+            log(f"DRY {acct.address} {self.chains[chain_id].name} to {to} value {value} gas {gas if gas is not None else 'auto'}")
+            return "dry", True
         if fee is None or tip is None:
             fee, tip = self.fees(chain_id)
         if gas is None:
@@ -471,6 +478,9 @@ class Bot:
         return txh, False
 
     def land(self, chain_id, acct, to, data, value, gas):
+        if self.dry:
+            txh, ok = self.send(chain_id, acct, to, data, value, gas)
+            return txh, ok, [txh]
         fee, tip = self.fees(chain_id)
         nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
         start = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
@@ -603,6 +613,10 @@ class Bot:
 
     def ensure(self, minter, chain_id, need):
         current = self.balance(chain_id, "native", minter.address)
+        if self.dry:
+            if current < need:
+                log(f"DRY {minter.address[:8]} short {(need - current) / 1e18:.6f} on {self.chains[chain_id].name}, not bridging")
+            return True
         if current >= need:
             return True
         if not self.bridge:
@@ -862,7 +876,10 @@ class Bot:
                 continue
             if ok:
                 done.add(who)
-                alert(f"OK {acct.address} {txh}")
+                if self.dry:
+                    alert(f"DRY {acct.address} would mint on {chain.name}, not broadcast")
+                else:
+                    alert(f"OK {acct.address} {txh}")
             else:
                 inflight[who] = sent
                 temporary = True
