@@ -54,15 +54,10 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
 | `TELEGRAM_CHAT_ID` | optional, the chat that receives alerts |
 | `ALLOW_ESTIMATE_FALLBACK` | `false` by default, see Simulation below |
-| `DRY_RUN` | `true` while testing. Delete it or set `false` to broadcast |
 | `STATE_PATH` | `/data/state.json` |
 
 3. Settings → add a Volume, mount path `/data`. That keeps the last processed block across restarts. Without it, a restart can miss mints that happened while it was down.
 4. The start command is `python bot.py`. Redeploy.
-
-## Dry run
-
-On Railway: add `DRY_RUN` = `true` under Variables, then redeploy. Startup logs `dry on`. A watched mint is simulated and logged, and nothing is broadcast or bridged. When you're ready to go live, change it to `false` or delete it, then redeploy. Startup should log `dry off`.
 
 Public RPCs are filled in for any `RPC_<chainId>` you leave empty. They rate-limit. Set Alchemy or an equivalent URL for any chain you really care about.
 
@@ -88,6 +83,31 @@ OK 0x0381... 0xhash
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot messages you when it starts, when a watched wallet mints, when a copy lands, and when a copy is given up on, skipped for lack of funds, or a bridge times out. Leave them unset and the bot logs only. Alerts are sent in the background, so a slow Telegram never delays a mint.
 
+## Telegram controls
+
+With the same two variables set, you can control the bot from the chat:
+
+| Command | What it does |
+|---|---|
+| `/status` | Shows whether copying is on or paused, dry run, chains, and how many retries are waiting |
+| `/off` | Pauses copying. The bot keeps watching blocks but skips new mints and tells you each one it skipped |
+| `/on` | Resumes copying |
+| `/wallets` | Lists the wallets being watched |
+| `/watch 0xADDRESS` | Adds one or more wallets to watch, separated by spaces |
+| `/unwatch 0xADDRESS` | Removes a wallet. The last wallet cannot be removed, so use `/off` to stop |
+| `/minters` | Shows your minter and funder addresses, never their keys |
+| `/balance` | Shows each minter's native balance on every chain |
+| `/cap` | Shows the mint value cap per chain. `/cap 56 0.1` sets one chain and `/cap all 0.05` sets all |
+| `/help` | Lists the commands |
+
+- Wallets added or removed from Telegram are saved and then replace `WATCH_ADDRESSES`. Changing that variable later has no effect until the saved state is cleared. Your own minter and funder addresses cannot be added, and the list holds up to 50 wallets. A new wallet is watched from the next block, with no replay.
+- `/cap` sets at most 1 native coin per chain. For a higher cap, change `MAX_MINT_ETH` or `MAX_MINT_<chainId>` in the host settings. A cap set from Telegram is saved and beats the variable.
+- Saved settings (pause, wallets, caps) live in the state file, so they only survive a restart if `STATE_PATH` is on a volume. Without one, the bot goes back to the variables.
+- Only messages from `TELEGRAM_CHAT_ID` are obeyed. Use a private chat with your bot, not a group, because anyone in a group chat could pause or resume it.
+- Mints that happen while paused are not copied later, so there is no burst of late mints when you resume.
+- The paused state is saved with the rest of the state. With a `/data` volume it survives restarts and redeploys.
+- There is deliberately no command to turn dry run off. Change `DRY_RUN` in Railway for that.
+
 To get a chat id, message your bot once, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id`.
 
 ## Simulation
@@ -108,6 +128,6 @@ No network or keys are needed. The tests cover call decoding, mint detection, fe
 - `MAX_MINT_ETH` skips a mint whose transaction value is above the cap. The number is in each chain's own coin (ETH, BNB, POL), so use `MAX_MINT_<chainId>` where 0.05 is the wrong size. Raise it if you want to copy paid mints.
 - Minter wallets are hot wallets. Keep only what a few mints need in them, and refill from the funder.
 - A copied mint can still be a token you cannot sell. The simulation proves you receive the NFT, not that it has value.
-- `DRY_RUN=true` logs the transaction and does not broadcast.
+- `DRY_RUN=true` logs the transaction and does not broadcast. Each minter that would have minted is reported on Telegram as "would mint", and nothing is sent or bridged.
 - Bridging is not instant. A mint can sell out while funds are in flight. `BRIDGE_TIMEOUT` defaults to 180 seconds.
 - Each minter sends the full copied transaction, so four minters mint the same quantity each, not split across them.

@@ -31,6 +31,9 @@ ZERO_TOPIC = "0x" + "0" * 64
 LIFI = "https://li.quest/v1/quote"
 MAX_ATTEMPTS = 3
 LOG_CHUNK = 20
+MAX_WATCH = 50
+# The largest cap /cap will set from Telegram, in native coin. Raise MAX_MINT_ETH in the environment for more.
+CAP_COMMAND_LIMIT = Decimal("1")
 
 
 def selector(signature):
@@ -134,6 +137,23 @@ def notify(message):
 def alert(msg):
     log(msg)
     notify(msg)
+
+
+def telegram_call(method, params=None, timeout=35):
+    """Call the Telegram Bot API without logging the token-bearing URL."""
+    token = env("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=urllib.parse.urlencode(params or {}).encode(),
+        headers={"user-agent": "copymint-bot"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read())
+    if not payload.get("ok", False):
+        raise RuntimeError(f"Telegram API {method} failed")
+    return payload
 
 
 class SeenSet:
@@ -334,6 +354,18 @@ def to_wei(amount):
     return int(Decimal(amount) * 10**18)
 
 
+def valid_address(text):
+    """Return a lower-case EVM address, or None if the input is malformed."""
+    text = text.strip()
+    if len(text) == 42 and text.startswith("0x") and all(char in "0123456789abcdefABCDEF" for char in text[2:]):
+        return text.lower()
+    return None
+
+
+def short_address(address):
+    return address[:6] + "…" + address[-4:]
+
+
 def word(addr):
     return addr[2:].lower().rjust(64, "0")
 
@@ -386,6 +418,11 @@ class Bot:
         self.heads = {}
         self.seen = SeenSet()
         self.pending = {}
+        self.paused = False
+        self.cap_overrides = {}
+        self.watch_saved = False
+        self._state_lock = threading.Lock()
+        self._watch_lock = threading.RLock()
         self._load()
 
     def cap(self, chain_id):
@@ -398,11 +435,234 @@ class Bot:
             self.seen = SeenSet(data.get("seen") or [])
             self.pending = data.get("pending") or {}
 
+            self.paused = bool(data.get("paused", False))
+            saved_watch = data.get("watch")
+            if isinstance(saved_watch, list) and saved_watch:
+                # Re-validate persisted data before trusting it.
+                clean = {a.lower() for a in saved_watch if valid_address(str(a))}
+                clean.difference_update(self.own)
+                if clean:
+                    self.watch = clean
+                    self.watch_saved = True
+            for raw_cid, raw_value in (data.get("caps") or {}).items():
+                try:
+                    cid, value = int(raw_cid), int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                if cid in self.max_values and value >= 0:
+                    self.max_values[cid] = value
+                    self.cap_overrides[cid] = value
+
     def _save(self):
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"heads": self.heads, "seen": self.seen.tail(5000), "pending": self.pending}))
-        tmp.replace(self.state_path)
+        # Both the scanner and Telegram control loop can save state.
+        with self._state_lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(".tmp")
+            state = {
+                "heads": self.heads,
+                "seen": self.seen.tail(5000),
+                "pending": self.pending,
+                "paused": self.paused,
+            }
+            if self.watch_saved:
+                state["watch"] = sorted(self.watch)
+            if self.cap_overrides:
+                state["caps"] = {str(cid): str(value) for cid, value in self.cap_overrides.items()}
+            tmp.write_text(json.dumps(state))
+            tmp.replace(self.state_path)
+
+    def balances_text(self):
+        accounts = list(self.minters) + ([self.funder] if self.funder else [])
+        jobs = [(index, cid) for index in range(len(accounts)) for cid in self.chains]
+
+        def fetch(job):
+            index, cid = job
+            try:
+                return index, cid, self.balance(cid, "native", accounts[index].address)
+            except Exception:
+                return index, cid, None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(fetch, jobs))
+        lines = []
+        for index, account in enumerate(accounts):
+            label = "funder" if self.funder is not None and account is self.funder else "minter"
+            lines.append(f"{label} {short_address(account.address)}")
+            for row_index, cid, balance in rows:
+                if row_index == index:
+                    amount = "n/a" if balance is None else f"{balance / 1e18:.4f}"
+                    lines.append(f"  {self.chains[cid].name}: {amount}")
+        return "\n".join(lines) or "No minter or funder wallets configured."
+
+    def wallets_text(self):
+        wallets = sorted(self.watch)
+        source = "saved list" if self.watch_saved else "WATCH_ADDRESSES"
+        return f"Watching {len(wallets)} wallet(s) ({source}):\n" + "\n".join(
+            to_checksum_address(address) for address in wallets
+        )
+
+    def watch_command(self, args):
+        if not args:
+            return "Usage: /watch 0xADDRESS [0xADDRESS ...]"
+        updated = set(self.watch)
+        lines = []
+        for raw in args:
+            address = valid_address(raw)
+            if address is None:
+                lines.append(f"{raw[:12]}: invalid EVM address")
+            elif address in self.own:
+                lines.append(f"{short_address(address)}: one of your own wallets; not added")
+            elif address in updated:
+                lines.append(f"{short_address(address)}: already watched")
+            elif len(updated) >= MAX_WATCH:
+                lines.append(f"{short_address(address)}: limit of {MAX_WATCH} watched wallets reached")
+            else:
+                updated.add(address)
+                lines.append(f"{short_address(address)}: added")
+        if updated != self.watch:
+            with self._watch_lock:
+                self.watch = updated
+            self.watch_saved = True
+            self._save()
+            lines.append("Changes take effect from the next scanned block; old mints are not replayed.")
+        return "\n".join(lines)
+
+    def unwatch_command(self, args):
+        if not args:
+            return "Usage: /unwatch 0xADDRESS [0xADDRESS ...]"
+        updated = set(self.watch)
+        lines = []
+        for raw in args:
+            address = valid_address(raw)
+            if address is None:
+                lines.append(f"{raw[:12]}: invalid EVM address")
+            elif address not in updated:
+                lines.append(f"{short_address(address)}: not currently watched")
+            elif len(updated) <= 1:
+                lines.append(f"{short_address(address)}: cannot remove the last watched wallet; use /off")
+            else:
+                updated.remove(address)
+                lines.append(f"{short_address(address)}: removed")
+        if updated != self.watch:
+            with self._watch_lock:
+                self.watch = updated
+            self.watch_saved = True
+            self._save()
+        return "\n".join(lines)
+
+    def cap_command(self, args):
+        if not args:
+            rows = [f"{chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
+            return (
+                "Mint value caps in each chain's native coin:\n"
+                + "\n".join(rows)
+                + "\nSet one: /cap 56 0.1 | Set all: /cap all 0.05"
+            )
+        if len(args) != 2:
+            return "Usage: /cap CHAIN_ID AMOUNT or /cap all AMOUNT"
+        target, amount_text = args
+        try:
+            amount = Decimal(amount_text)
+        except Exception:
+            return "Amount must be a number."
+        if not amount.is_finite() or amount < 0 or amount > CAP_COMMAND_LIMIT:
+            return (
+                f"Amount must be between 0 and {CAP_COMMAND_LIMIT}. "
+                "For a higher cap, edit MAX_MINT_ETH or MAX_MINT_<chainId>."
+            )
+        if target.lower() == "all":
+            chain_ids = list(self.chains)
+        else:
+            try:
+                cid = int(target)
+            except ValueError:
+                return "Chain ID must be an integer or 'all'."
+            if cid not in self.chains:
+                return f"Chain {cid} is not enabled."
+            chain_ids = [cid]
+        value = to_wei(amount_text)
+        for cid in chain_ids:
+            self.max_values[cid] = value
+            self.cap_overrides[cid] = value
+        self._save()
+        return f"Cap set to {amount_text} on " + ", ".join(self.chains[cid].name for cid in chain_ids)
+
+    def command_reply(self, command, args=()):
+        if command == "/status":
+            names = ", ".join(chain.name for chain in self.chains.values())
+            return (
+                f"copymint is {'PAUSED' if self.paused else 'ON'}\n"
+                f"dry run: {'on' if self.dry else 'off'}\nchains: {names}\n"
+                f"watching {len(self.watch)} wallet(s), {len(self.minters)} minter(s)\n"
+                f"copies waiting to retry: {len(self.pending)}"
+            )
+        if command == "/off":
+            self.paused = True
+            for key in list(self.pending):
+                self.seen.add(key)
+            self.pending.clear()
+            self._save()
+            return "Paused. New mints will be skipped, and pending retries have been dropped. Use /on to resume."
+        if command == "/on":
+            self.paused = False
+            self._save()
+            return "Resumed. Only mints seen from now on will be copied; paused mints are not replayed."
+        if command == "/wallets":
+            return self.wallets_text()
+        if command == "/watch":
+            return self.watch_command(args)
+        if command == "/unwatch":
+            return self.unwatch_command(args)
+        if command == "/minters":
+            lines = [f"minter {account.address}" for account in self.minters]
+            if self.funder:
+                lines.append(f"funder {self.funder.address}")
+            return "\n".join(lines)
+        if command == "/balance":
+            return self.balances_text()
+        if command == "/cap":
+            return self.cap_command(args)
+        if command in ("/help", "/start"):
+            return (
+                "Commands:\n/status\n/off\n/on\n/wallets\n/watch 0xADDRESS\n"
+                "/unwatch 0xADDRESS\n/minters\n/balance\n/cap [CHAIN_ID AMOUNT]"
+            )
+        return None
+
+    def handle_command(self, update, chat_id):
+        message = update.get("message") or {}
+        if str((message.get("chat") or {}).get("id")) != str(chat_id):
+            return
+        parts = (message.get("text") or "").strip().split()
+        if not parts:
+            return
+        reply = self.command_reply(parts[0].split("@")[0].lower(), parts[1:])
+        if reply:
+            log(f"telegram command {parts[0].split('@')[0]}")
+            notify(reply)
+
+    def control_loop(self):
+        chat_id = env("TELEGRAM_CHAT_ID")
+        offset = None
+        try:
+            # Ignore commands sent before this process started.
+            first = telegram_call("getUpdates", {"offset": -1, "timeout": 0}, timeout=15)
+            updates = first.get("result") or []
+            if updates:
+                offset = updates[-1]["update_id"] + 1
+        except Exception as exc:
+            log(f"telegram command startup failed: {type(exc).__name__}")
+        while True:
+            try:
+                params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
+                if offset is not None:
+                    params["offset"] = offset
+                for update in telegram_call("getUpdates", params).get("result") or []:
+                    offset = update["update_id"] + 1
+                    self.handle_command(update, chat_id)
+            except Exception as exc:
+                log(f"telegram command polling failed: {type(exc).__name__}")
+                time.sleep(10)
 
     def balance(self, chain_id, token, who):
         if token == "native":
@@ -645,39 +905,37 @@ class Bot:
         return self.balance(chain_id, "native", minter.address) >= need
 
     def rewrite_watched(self, data, new):
-        for old in self.watch:
+        with self._watch_lock:
+            watched = list(self.watch)
+        for old in watched:
             data = rewrite(data, old, new)
         return data
 
-    def minted_map(self, logs):
+    def minted_map(self, logs, recipients=None):
+        # Take one reference to the set, since the Telegram thread can replace self.watch at any time.
+        recipients = self.watch if recipients is None else recipients
         totals = {}
         for entry in logs:
             topics = [t.lower() for t in entry.get("topics") or []]
             collection = entry.get("address", "").lower()
             qty = 0
             if len(topics) >= 3 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
-                if topic_address(topics[2]) in self.watch:
+                if topic_address(topics[2]) in recipients:
                     qty = 1
             elif len(topics) >= 4 and topics[0] == TRANSFER_SINGLE and topics[2] == ZERO_TOPIC:
-                if topic_address(topics[3]) in self.watch:
+                if topic_address(topics[3]) in recipients:
                     qty = single_qty(entry.get("data") or "0x")
             elif len(topics) >= 4 and topics[0] == TRANSFER_BATCH and topics[2] == ZERO_TOPIC:
-                if topic_address(topics[3]) in self.watch:
+                if topic_address(topics[3]) in recipients:
                     qty = batch_qty(entry.get("data") or "0x")
             if qty > 0 and collection:
                 totals[collection] = totals.get(collection, 0) + qty
         return totals
 
     def minted_for(self, logs, recipient):
-        recip = recipient.lower()
-        totals = {}
-        saved = self.watch
-        self.watch = {recip}
-        try:
-            totals = self.minted_map(logs)
-        finally:
-            self.watch = saved
-        return totals
+        # Pass the recipient in rather than swapping self.watch: a /watch from Telegram
+        # during the swap would be overwritten when the old set was restored.
+        return self.minted_map(logs, {recipient.lower()})
 
     def simulate(self, chain_id, acct, target, data, value):
         call = {
@@ -898,7 +1156,9 @@ class Bot:
         self._save()
 
     def logs_for(self, chain_id, start, end):
-        watched = ["0x" + word(addr) for addr in self.watch]
+        with self._watch_lock:
+            watched_addresses = list(self.watch)
+        watched = ["0x" + word(addr) for addr in watched_addresses]
         queries = [
             [TRANSFER, ZERO_TOPIC, watched],
             [TRANSFER_SINGLE, None, ZERO_TOPIC, watched],
@@ -953,6 +1213,11 @@ class Bot:
                 self.seen.add(f"{chain_id}:{txh}")
                 self._save()
                 continue
+            if self.paused:
+                self.seen.add(f"{chain_id}:{txh}")
+                self._save()
+                alert(f"paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
+                continue
             try:
                 self.copy(chain_id, tx, want)
             except Exception as exc:
@@ -982,6 +1247,8 @@ class Bot:
             cursor = reached + 1
 
     def retry_pending(self):
+        if self.paused:
+            return
         for key, item in list(self.pending.items()):
             chain_id = int(item["chain"])
             if chain_id not in self.chains:
@@ -1005,7 +1272,13 @@ class Bot:
         if self.funder:
             log(f"funder {self.funder.address}")
         log(f"bridge {'on' if self.bridge else 'off'} dry {'on' if self.dry else 'off'}")
-        notify(f"copymint-bot started: {len(self.watch)} wallet(s) on {names}, dry run {'on' if self.dry else 'off'}")
+        notify(
+            f"copymint-bot started ({'PAUSED' if self.paused else 'on'}): {len(self.watch)} wallet(s) on {names}, "
+            f"dry run {'on' if self.dry else 'off'}"
+        )
+        if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
+            threading.Thread(target=self.control_loop, daemon=True).start()
+            log("telegram controls enabled")
         while True:
             for cid in self.chains:
                 try:
