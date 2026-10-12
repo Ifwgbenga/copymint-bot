@@ -9,6 +9,7 @@ transaction is replaced once if it is still pending after two blocks.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import threading
@@ -106,7 +107,7 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
-def notify(message):
+def notify(message, html=False):
     """Send a Telegram message when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
 
     Runs in a background thread so a slow Telegram never delays a mint, and
@@ -117,10 +118,14 @@ def notify(message):
     if not token or not chat:
         return
 
+    params = {"chat_id": chat, "text": message[:3900], "disable_web_page_preview": "true"}
+    if html:
+        params["parse_mode"] = "HTML"
+
     def worker():
         try:
             body = urllib.parse.urlencode(
-                {"chat_id": chat, "text": message[:3900], "disable_web_page_preview": "true"}
+                params
             ).encode()
             req = urllib.request.Request(
                 f"https://api.telegram.org/bot{token}/sendMessage",
@@ -134,9 +139,36 @@ def notify(message):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def alert(msg):
+def alert(msg, rich=None):
+    """Log plain text. Send the Telegram HTML version when one is given."""
     log(msg)
-    notify(msg)
+    if rich is None:
+        notify(msg)
+    else:
+        notify(rich, html=True)
+
+
+def esc(value):
+    return html.escape(str(value), quote=False)
+
+
+def code(value):
+    return f"<code>{esc(value)}</code>"
+
+
+def card(title, *rows):
+    """A Telegram HTML message: a bold headline, then 'Label: value' lines.
+
+    Row values are used as given, so callers escape or wrap them with esc() and code().
+    """
+    lines = [f"<b>{esc(title)}</b>"]
+    lines += [f"{label}: {value}" for label, value in rows if value not in (None, "")]
+    return "\n".join(lines)
+
+
+def collections_html(want):
+    """One line per collection: the full contract address and how many were minted."""
+    return "\n".join(f"{code(collection)} ×{amount}" for collection, amount in want.items())
 
 
 MENU = (
@@ -1163,7 +1195,17 @@ class Bot:
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:
-            alert(f"🎯 mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
+            via = tx["to"] if tx["to"].lower() not in {c.lower() for c in want} else None
+            alert(
+                f"🎯 mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}",
+                card(
+                    f"🎯 Mint detected · {chain.name}",
+                    ("Wallet", code(tx["from"])),
+                    ("Collection (CA)", "\n" + collections_html(want)),
+                    ("Called", code(via) if via else None),
+                    ("Tx", code(tx["hash"])),
+                ),
+            )
         if not options:
             log(f"skip {tx['hash']} no mint call")
             self.seen.add(key)
@@ -1189,7 +1231,15 @@ class Bot:
                 inflight.pop(who, None)
                 if hit[1]:
                     done.add(who)
-                    alert(f"✅ OK {acct.address} {hit[0]}")
+                    alert(
+                        f"✅ OK {acct.address} {hit[0]}",
+                        card(
+                            f"✅ Copied · {chain.name}",
+                            ("Minter", code(acct.address)),
+                            ("Collection (CA)", "\n" + collections_html(want)),
+                            ("Tx", code(hit[0])),
+                        ),
+                    )
                     continue
             chosen = self.pick(chain_id, acct, options, want)
             if not chosen:
@@ -1199,7 +1249,15 @@ class Bot:
             gas = int(gas_used * 1.25) + 20_000
             fee, _tip = self.fees(chain_id)
             if not self.ensure(acct, chain_id, value + gas * fee):
-                alert(f"💸 skip {acct.address[:8]} not enough on {chain.name} and no route")
+                alert(
+                    f"💸 skip {acct.address[:8]} not enough on {chain.name} and no route",
+                    card(
+                        f"💸 Skipped · {chain.name}",
+                        ("Minter", code(acct.address)),
+                        ("Why", "not enough funds and no bridge route"),
+                        ("Collection (CA)", "\n" + collections_html(want)),
+                    ),
+                )
                 temporary = True
                 continue
             try:
@@ -1211,9 +1269,25 @@ class Bot:
             if ok:
                 done.add(who)
                 if self.dry:
-                    alert(f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast")
+                    alert(
+                        f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast",
+                        card(
+                            f"🧪 Dry run · {chain.name}",
+                            ("Minter", code(acct.address)),
+                            ("Collection (CA)", "\n" + collections_html(want)),
+                            ("Result", "would mint, not broadcast"),
+                        ),
+                    )
                 else:
-                    alert(f"✅ OK {acct.address} {txh}")
+                    alert(
+                        f"✅ OK {acct.address} {txh}",
+                        card(
+                            f"✅ Copied · {chain.name}",
+                            ("Minter", code(acct.address)),
+                            ("Collection (CA)", "\n" + collections_html(want)),
+                            ("Tx", code(txh)),
+                        ),
+                    )
             else:
                 inflight[who] = sent
                 temporary = True
@@ -1224,7 +1298,15 @@ class Bot:
             self.seen.add(key)
             self.pending.pop(key, None)
         elif item["attempts"] >= MAX_ATTEMPTS:
-            alert(f"🛑 giving up {tx['hash']} after {item['attempts']} attempts")
+            alert(
+                f"🛑 giving up {tx['hash']} after {item['attempts']} attempts",
+                card(
+                    f"🛑 Gave up · {chain.name}",
+                    ("Attempts", item["attempts"]),
+                    ("Collection (CA)", "\n" + collections_html(want)),
+                    ("Source tx", code(tx["hash"])),
+                ),
+            )
             self.seen.add(key)
             self.pending.pop(key, None)
         else:
@@ -1348,16 +1430,32 @@ class Bot:
             if self.paused:
                 self.seen.add(key)
                 self._save()
-                alert(f"⏸ paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
+                alert(
+                    f"⏸ paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}",
+                    card(
+                        f"⏸ Paused, mint skipped · {self.chains[chain_id].name}",
+                        ("Wallet", code(sender)),
+                        ("Collection (CA)", "\n" + collections_html(want)),
+                        ("Tx", code(txh)),
+                    ),
+                )
                 return
             allowed, blocked = self.claim_collection_cooldown(chain_id, txh, want)
             if not allowed:
-                names = ", ".join(item[0].split(":", 1)[1][:10] for item in blocked)
+                names = ", ".join(item[0].split(":", 1)[1] for item in blocked)
                 wait = max((item[1] for item in blocked), default=0)
                 log(f"skip {txh}: collection cooldown active for {names}; about {wait}s remaining")
                 self.seen.add(key)
                 self._save()
-                alert(f"⏭ duplicate collection mint suppressed on {self.chains[chain_id].name}: {names}; cooldown ~{wait}s")
+                alert(
+                    f"⏭ duplicate collection mint suppressed on {self.chains[chain_id].name}: {names}; cooldown ~{wait}s",
+                    card(
+                        f"⏭ Duplicate mint suppressed · {self.chains[chain_id].name}",
+                        ("Collection (CA)", "\n" + "\n".join(code(item[0].split(":", 1)[1]) for item in blocked)),
+                        ("Cooldown left", f"~{wait}s"),
+                        ("Tx", code(txh)),
+                    ),
+                )
                 return
             try:
                 finished = self.copy(chain_id, tx, want)
