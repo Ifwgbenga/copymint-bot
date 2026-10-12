@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from eth_account import Account
@@ -96,6 +99,58 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
+def notify(message):
+    """Send a Telegram message when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
+
+    Runs in a background thread so a slow Telegram never delays a mint, and
+    never raises. The failure log leaves out the URL because it holds the token.
+    """
+    token = env("TELEGRAM_BOT_TOKEN")
+    chat = env("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+
+    def worker():
+        try:
+            body = urllib.parse.urlencode(
+                {"chat_id": chat, "text": message[:3900], "disable_web_page_preview": "true"}
+            ).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=body,
+                headers={"user-agent": "copymint-bot"},
+            )
+            urllib.request.urlopen(req, timeout=10).read()
+        except Exception as exc:
+            log(f"telegram alert failed: {type(exc).__name__}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def alert(msg):
+    log(msg)
+    notify(msg)
+
+
+class SeenSet:
+    """A set that remembers insertion order, so the newest keys survive trimming."""
+
+    def __init__(self, items=()):
+        self._items = dict.fromkeys(items)
+
+    def add(self, key):
+        self._items[key] = None
+
+    def __contains__(self, key):
+        return key in self._items
+
+    def __len__(self):
+        return len(self._items)
+
+    def tail(self, count):
+        return list(self._items)[-count:]
+
+
 def as_int(value):
     if isinstance(value, int):
         return value
@@ -120,7 +175,8 @@ def decode_bytes_array(body, start):
     items = []
     for i in range(count):
         relative = word_int(body, start + 32 + 32 * i)
-        items.append(read_bytes(body, start + relative))
+        # Offsets in a dynamic array are relative to the word after the length.
+        items.append(read_bytes(body, start + 32 + relative))
     return items
 
 
@@ -270,6 +326,10 @@ def load_keys(raw):
     return out
 
 
+def to_wei(amount):
+    return int(Decimal(amount) * 10**18)
+
+
 def word(addr):
     return addr[2:].lower().rjust(64, "0")
 
@@ -304,7 +364,10 @@ class Bot:
             chains[cid] = Chain(cid, name, env(f"RPC_{cid}", default))
         self.rpc = RPC(chains)
         self.chains = chains
-        self.max_value = int(float(env("MAX_MINT_ETH", "0.05")) * 10**18)
+        # Caps are in each chain's native coin (ETH, BNB, POL...). MAX_MINT_<chainId> overrides the default.
+        default_cap = env("MAX_MINT_ETH", "0.05")
+        self.max_values = {cid: to_wei(env(f"MAX_MINT_{cid}", default_cap)) for cid in chains}
+        self.allow_estimate = env("ALLOW_ESTIMATE_FALLBACK", "false").lower() in ("1", "true", "yes")
         self.bridge = env("ENABLE_BRIDGE", "true").lower() in ("1", "true", "yes")
         self.bridge_timeout = int(env("BRIDGE_TIMEOUT", "180"))
         self.poll = float(env("POLL_SECONDS", "0.4"))
@@ -317,21 +380,24 @@ class Bot:
                 self.state_path = Path("state.json")
                 log("no /data volume, using ./state.json")
         self.heads = {}
-        self.seen = set()
+        self.seen = SeenSet()
         self.pending = {}
         self._load()
+
+    def cap(self, chain_id):
+        return self.max_values[chain_id]
 
     def _load(self):
         if self.state_path.exists():
             data = json.loads(self.state_path.read_text())
             self.heads = {int(k): int(v) for k, v in (data.get("heads") or {}).items()}
-            self.seen = set(data.get("seen") or [])
+            self.seen = SeenSet(data.get("seen") or [])
             self.pending = data.get("pending") or {}
 
     def _save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"heads": self.heads, "seen": list(self.seen)[-5000:], "pending": self.pending}))
+        tmp.write_text(json.dumps({"heads": self.heads, "seen": self.seen.tail(5000), "pending": self.pending}))
         tmp.replace(self.state_path)
 
     def balance(self, chain_id, token, who):
@@ -410,26 +476,38 @@ class Bot:
         start = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
         txh, ok = self.send(chain_id, acct, to, data, value, gas, fee, tip, nonce, wait=False)
         if self.dry:
-            return txh, True
+            return txh, True, [txh]
+        # Keep every hash sent for this nonce. Either the original or the
+        # replacement can land, so both have to be watched for a receipt.
+        sent = [txh]
         bumped = False
         deadline = time.time() + 90
         while time.time() < deadline:
-            rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
-            if rec:
-                return txh, int(rec["status"], 16) == 1
+            hit = self.receipt_for(chain_id, sent)
+            if hit:
+                return hit[0], hit[1], sent
             now = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
             if not bumped and now >= start + 2:
                 bumped = True
                 new_fee = max(int(fee * 2), fee + 1)
                 new_tip = min(max(int(tip * 2), tip + 1), new_fee)
                 try:
-                    txh, ok = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
-                    log(f"replaced {acct.address[:8]} {txh}")
+                    new_hash, _ = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
+                    sent.append(new_hash)
+                    log(f"replaced {acct.address[:8]} {new_hash}")
                 except Exception as exc:
                     if "nonce" not in str(exc).lower():
                         log(f"replace {acct.address[:8]} {exc}")
             time.sleep(0.6)
-        return txh, False
+        return sent[-1], False, sent
+
+    def receipt_for(self, chain_id, hashes):
+        """Return (hash, success) for the first hash that has a receipt, else None."""
+        for txh in hashes:
+            rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+            if rec:
+                return txh, int(rec["status"], 16) == 1
+        return None
 
     def lifi_quote(self, src, dst, token, amount, sender, recipient):
         qs = urllib.parse.urlencode(
@@ -503,38 +581,53 @@ class Bot:
         log(f"bridge {'OK' if ok else 'FAIL'} {txh}")
         return ok
 
+    def holdings(self, holder):
+        """Every non-zero native and stablecoin balance a wallet has, read in parallel."""
+        jobs = []
+        for src in self.chains:
+            jobs.append((src, "native", 18))
+            for token, decimals in STABLES.get(src, []):
+                jobs.append((src, token, decimals))
+
+        def fetch(job):
+            src, token, decimals = job
+            try:
+                return src, token, decimals, self.balance(src, token, holder.address)
+            except Exception as exc:
+                log(f"balance {self.chains[src].name} {exc}")
+                return src, token, decimals, 0
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = list(pool.map(fetch, jobs))
+        return [row for row in rows if row[3] > 0]
+
     def ensure(self, minter, chain_id, need):
-        if self.balance(chain_id, "native", minter.address) >= need:
+        current = self.balance(chain_id, "native", minter.address)
+        if current >= need:
             return True
         if not self.bridge:
             return False
-        short = need - self.balance(chain_id, "native", minter.address)
+        short = need - current
         holders = [minter]
         if self.funder and self.funder.address.lower() != minter.address.lower():
             holders.append(self.funder)
         for holder in holders:
-            for src, chain in self.chains.items():
-                candidates = [("native", 18, self.balance(src, "native", holder.address))]
-                for token, decimals in STABLES.get(src, []):
-                    candidates.append((token, decimals, self.balance(src, token, holder.address)))
-                for token, decimals, have in candidates:
-                    if have <= 0:
-                        continue
-                    if src == chain_id and token == "native":
-                        continue
-                    quote = self.sized_quote(src, chain_id, token, decimals, have, holder.address, minter.address, short)
-                    if not quote:
-                        continue
-                    label = "native" if token == "native" else token[:8]
-                    log(f"funding {minter.address[:8]} from {chain.name} {label}")
-                    if not self.execute_quote(src, holder, quote, token):
-                        continue
-                    deadline = time.time() + self.bridge_timeout
-                    while time.time() < deadline:
-                        if self.balance(chain_id, "native", minter.address) >= need:
-                            return True
-                        time.sleep(3)
-                    log(f"bridge timed out for {minter.address[:8]}")
+            for src, token, decimals, have in self.holdings(holder):
+                if src == chain_id and token == "native":
+                    continue
+                quote = self.sized_quote(src, chain_id, token, decimals, have, holder.address, minter.address, short)
+                if not quote:
+                    continue
+                label = "native" if token == "native" else token[:8]
+                log(f"funding {minter.address[:8]} from {self.chains[src].name} {label}")
+                if not self.execute_quote(src, holder, quote, token):
+                    continue
+                deadline = time.time() + self.bridge_timeout
+                while time.time() < deadline:
+                    if self.balance(chain_id, "native", minter.address) >= need:
+                        return True
+                    time.sleep(3)
+                alert(f"bridge timed out for {minter.address[:8]} on {self.chains[chain_id].name}")
         return self.balance(chain_id, "native", minter.address) >= need
 
     def rewrite_watched(self, data, new):
@@ -650,7 +743,7 @@ class Bot:
         if len(simple) != 1:
             return None
         target, data, value = simple[0]
-        if value > self.max_value:
+        if value > self.cap(chain_id):
             value = 0
         try:
             est = int(
@@ -674,7 +767,7 @@ class Bot:
             data = self.rewrite_watched(raw, acct.address)
             values = []
             for value in (0, hinted):
-                if value not in values and value <= self.max_value:
+                if value not in values and value <= self.cap(chain_id):
                     values.append(value)
             for value in values:
                 result = self.simulate(chain_id, acct, target, data, value)
@@ -693,7 +786,13 @@ class Bot:
         if best:
             return best
         if not saw_real and unsupported:
-            return self.fallback(chain_id, acct, options, want)
+            if self.allow_estimate:
+                return self.fallback(chain_id, acct, options, want)
+            log(
+                f"{self.chains[chain_id].name} RPC cannot simulate, skipping. "
+                f"Set RPC_{chain_id} to a node with eth_simulateV1 or debug_traceCall, "
+                "or set ALLOW_ESTIMATE_FALLBACK=true to send on a gas estimate alone."
+            )
         return None
 
     def copy(self, chain_id, tx, want):
@@ -716,7 +815,7 @@ class Bot:
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:
-            log(f"mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
+            alert(f"mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
         if not options:
             log(f"skip {tx['hash']} no mint call")
             self.seen.add(key)
@@ -733,14 +832,16 @@ class Bot:
                 continue
             previous = inflight.get(who)
             if previous:
-                rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [previous])
-                if rec is None:
+                # Older state files hold one hash as a string, newer ones a list.
+                hashes = [previous] if isinstance(previous, str) else list(previous)
+                hit = self.receipt_for(chain_id, hashes)
+                if hit is None:
                     temporary = True
                     continue
                 inflight.pop(who, None)
-                if int(rec["status"], 16) == 1:
+                if hit[1]:
                     done.add(who)
-                    log(f"OK {acct.address} {previous}")
+                    alert(f"OK {acct.address} {hit[0]}")
                     continue
             chosen = self.pick(chain_id, acct, options, want)
             if not chosen:
@@ -750,32 +851,29 @@ class Bot:
             gas = int(gas_used * 1.25) + 20_000
             fee, _tip = self.fees(chain_id)
             if not self.ensure(acct, chain_id, value + gas * fee):
-                log(f"skip {acct.address[:8]} not enough on {chain.name} and no route")
+                alert(f"skip {acct.address[:8]} not enough on {chain.name} and no route")
                 temporary = True
                 continue
             try:
-                txh, ok = self.land(chain_id, acct, target, data, value, gas)
+                txh, ok, sent = self.land(chain_id, acct, target, data, value, gas)
             except Exception as exc:
                 log(f"send {acct.address[:8]} {exc}")
                 temporary = True
                 continue
             if ok:
                 done.add(who)
-                log(f"OK {acct.address} {txh}")
+                alert(f"OK {acct.address} {txh}")
             else:
-                inflight[who] = txh
+                inflight[who] = sent
                 temporary = True
                 log(f"pending {acct.address} {txh}")
         item["done"] = sorted(done)
         item["inflight"] = inflight
-        if len(done) == len(self.minters) or (not temporary and item["attempts"] >= 1 and len(done) == len(self.minters)):
-            self.seen.add(key)
-            self.pending.pop(key, None)
-        elif not temporary:
+        if len(done) == len(self.minters) or not temporary:
             self.seen.add(key)
             self.pending.pop(key, None)
         elif item["attempts"] >= MAX_ATTEMPTS:
-            log(f"giving up {tx['hash']} after {item['attempts']} attempts")
+            alert(f"giving up {tx['hash']} after {item['attempts']} attempts")
             self.seen.add(key)
             self.pending.pop(key, None)
         else:
@@ -833,7 +931,7 @@ class Bot:
             sender = (tx.get("from") or "").lower()
             if sender not in self.watch or sender in self.own:
                 continue
-            if int(tx.get("value") or "0", 16) > self.max_value:
+            if int(tx.get("value") or "0", 16) > self.cap(chain_id):
                 log(f"skip {txh} value {int(tx.get('value'), 16) / 1e18:.4f} over cap")
                 self.seen.add(f"{chain_id}:{txh}")
                 self._save()
@@ -890,6 +988,7 @@ class Bot:
         if self.funder:
             log(f"funder {self.funder.address}")
         log(f"bridge {'on' if self.bridge else 'off'} dry {'on' if self.dry else 'off'}")
+        notify(f"copymint-bot started: {len(self.watch)} wallet(s) on {names}, dry run {'on' if self.dry else 'off'}")
         while True:
             for cid in self.chains:
                 try:

@@ -49,7 +49,11 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `RPC_4663` | your Robinhood RPC |
 | `RPC_8453` | Base, and the same for any chain you leave unset only if you accept the public RPC |
 | `ENABLE_BRIDGE` | `true` |
-| `MAX_MINT_ETH` | `0.05` |
+| `MAX_MINT_ETH` | `0.05`, the cap in each chain's native coin |
+| `MAX_MINT_<chainId>` | optional per-chain cap, for example `MAX_MINT_56=0.1` for BNB Chain |
+| `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
+| `TELEGRAM_CHAT_ID` | optional, the chat that receives alerts |
+| `ALLOW_ESTIMATE_FALLBACK` | `false` by default, see Simulation below |
 | `STATE_PATH` | `/data/state.json` |
 
 3. Settings → add a Volume, mount path `/data`. That keeps the last processed block across restarts. Without it, a restart can miss mints that happened while it was down.
@@ -75,10 +79,30 @@ bridge OK 0xhash
 OK 0x0381... 0xhash
 ```
 
+## Telegram alerts
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot messages you when it starts, when a watched wallet mints, when a copy lands, and when a copy is given up on, skipped for lack of funds, or a bridge times out. Leave them unset and the bot logs only. Alerts are sent in the background, so a slow Telegram never delays a mint.
+
+To get a chat id, message your bot once, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id`.
+
+## Simulation
+
+Every copy is simulated first, using `eth_simulateV1` or `debug_traceCall`. Public RPCs often support neither. When the RPC cannot simulate, the bot skips the mint and logs which `RPC_<chainId>` to replace. Setting `ALLOW_ESTIMATE_FALLBACK=true` lets it send on a gas estimate alone, which does not prove that the minter receives the NFT. Leave it off unless you accept that.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+No network or keys are needed. The tests cover call decoding, mint detection, fee-bump tracking, caps, state saving and alerts.
+
 ## Rules
 
 - `WATCH_ADDRESSES` must be other people. Do not put your own minter keys in that list, or a copy could loop.
-- `MAX_MINT_ETH` skips a mint whose transaction value is above the cap. Raise it if you want to copy paid mints.
+- `MAX_MINT_ETH` skips a mint whose transaction value is above the cap. The number is in each chain's own coin (ETH, BNB, POL), so use `MAX_MINT_<chainId>` where 0.05 is the wrong size. Raise it if you want to copy paid mints.
+- Minter wallets are hot wallets. Keep only what a few mints need in them, and refill from the funder.
+- A copied mint can still be a token you cannot sell. The simulation proves you receive the NFT, not that it has value.
 - `DRY_RUN=true` logs the transaction and does not broadcast.
 - Bridging is not instant. A mint can sell out while funds are in flight. `BRIDGE_TIMEOUT` defaults to 180 seconds.
 - Each minter sends the full copied transaction, so four minters mint the same quantity each, not split across them.
