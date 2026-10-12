@@ -51,6 +51,9 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `ENABLE_BRIDGE` | `true` |
 | `MAX_MINT_ETH` | `0.05`, the cap in each chain's native coin |
 | `MAX_MINT_<chainId>` | optional per-chain cap, for example `MAX_MINT_56=0.1` for BNB Chain |
+| `MINT_COOLDOWN_SECONDS` | `300` by default; suppresses a second copy trigger for the same collection on the same chain for five minutes. `0` disables it |
+| `WSS_<chainId>` | optional `wss://` endpoint (for example `WSS_8453`) for instant detection; see WebSocket mode |
+| `WSS_BACKUP_SECONDS` | `5` by default; how often polling checks a chain whose socket is live |
 | `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
 | `TELEGRAM_CHAT_ID` | optional, the chat that receives alerts |
 | `ALLOW_ESTIMATE_FALLBACK` | `false` by default, see Simulation below |
@@ -110,6 +113,10 @@ With the same two variables set, type `/` in the chat with the bot. Telegram sho
 
 To get a chat id, message your bot once, then open `https://api.telegram.org/bot<TOKEN>/getUpdates` and read `chat.id`.
 
+## WebSocket mode
+
+Set `WSS_<chainId>` to your provider's `wss://` URL (Alchemy gives one per chain) and the bot subscribes to mint logs for your watched wallets instead of waiting for the next poll. It reads each transaction's receipt, so a mint of 10 is copied as 10. Polling keeps running as a slow backup (`WSS_BACKUP_SECONDS`) while a socket is live and returns to full speed if the socket drops. A transaction seen by both is copied once. The bot reconnects with backoff, resubscribes when you change the watch list, and sends one Telegram alert after five failed connects in a row. Look for `<chain> websocket live` in the logs, or `websocket live:` in `/status`. Chains without a `WSS_` variable just poll.
+
 ## Simulation
 
 Every copy is simulated first, using `eth_simulateV1` or `debug_traceCall`. Public RPCs often support neither. When the RPC cannot simulate, the bot skips the mint and logs which `RPC_<chainId>` to replace. Setting `ALLOW_ESTIMATE_FALLBACK=true` lets it send on a gas estimate alone, which does not prove that the minter receives the NFT. Leave it off unless you accept that.
@@ -125,6 +132,7 @@ No network or keys are needed. The tests cover call decoding, mint detection, fe
 ## Rules
 
 - `WATCH_ADDRESSES` must be other people. Do not put your own minter keys in that list, or a copy could loop.
+- Cross-wallet duplicate suppression is shared across all watched wallets and keyed by chain plus NFT collection. The first eligible mint claims the cooldown and other transactions for that collection are skipped until it expires, including repeat mints by the same wallet. If a copy finishes with no minter minting and is not retrying, the claim is released. Set `MINT_COOLDOWN_SECONDS=0` to disable it. A source transaction touching several collections is suppressed as a whole if any of them is cooling down.
 - `MAX_MINT_ETH` skips a mint whose transaction value is above the cap. The number is in each chain's own coin (ETH, BNB, POL), so use `MAX_MINT_<chainId>` where 0.05 is the wrong size. Raise it if you want to copy paid mints.
 - Minter wallets are hot wallets. Keep only what a few mints need in them, and refill from the funder.
 - A copied mint can still be a token you cannot sell. The simulation proves you receive the NFT, not that it has value.

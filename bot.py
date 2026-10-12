@@ -334,6 +334,7 @@ class Chain:
     id: int
     name: str
     rpc: str
+    wss: str = ""
 
 
 class RPC:
@@ -417,7 +418,11 @@ class Bot:
             if cid not in CHAINS:
                 raise SystemExit(f"Unknown chain id {cid}")
             name, default = CHAINS[cid]
-            chains[cid] = Chain(cid, name, env(f"RPC_{cid}", default))
+            wss = env(f"WSS_{cid}")
+            if wss and not wss.startswith(("wss://", "ws://")):
+                # The value is not echoed, because the URL usually contains an API key.
+                raise SystemExit(f"WSS_{cid} must start with wss://")
+            chains[cid] = Chain(cid, name, env(f"RPC_{cid}", default), wss)
         self.rpc = RPC(chains)
         self.chains = chains
         # Caps are in each chain's native coin (ETH, BNB, POL...). MAX_MINT_<chainId> overrides the default.
@@ -438,11 +443,29 @@ class Bot:
         self.heads = {}
         self.seen = SeenSet()
         self.pending = {}
+        try:
+            self.mint_cooldown_seconds = max(0, int(env("MINT_COOLDOWN_SECONDS", "300")))
+        except ValueError as exc:
+            raise SystemExit("MINT_COOLDOWN_SECONDS must be a non-negative integer") from exc
+        # One cooldown per chain + NFT collection, shared by every watched wallet.
+        self.collection_cooldowns = {}
+        self._collection_lock = threading.Lock()
         self.paused = False
         self.cap_overrides = {}
         self.watch_saved = False
         self._state_lock = threading.Lock()
         self._watch_lock = threading.RLock()
+        # WebSocket mode. A chain with WSS_<chainId> set is pushed new mints and is polled
+        # only every WSS_BACKUP_SECONDS as a safety net, or at full speed while its socket is down.
+        self.wss_backup = float(env("WSS_BACKUP_SECONDS", "5"))
+        self.ws_live = {}
+        self.last_poll = {}
+        self.watch_version = 0
+        # One copy at a time, because the minters' nonces are shared by every thread.
+        self._copy_lock = threading.RLock()
+        self._ws_lock = threading.Lock()
+        self._ws_recent = {}
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ws")
         self._load()
 
     def cap(self, chain_id):
@@ -454,6 +477,16 @@ class Bot:
             self.heads = {int(k): int(v) for k, v in (data.get("heads") or {}).items()}
             self.seen = SeenSet(data.get("seen") or [])
             self.pending = data.get("pending") or {}
+            self.collection_cooldowns = {}
+            now = time.time()
+            for key, record in (data.get("collection_cooldowns") or {}).items():
+                try:
+                    until = float(record.get("until", 0))
+                    tx_hash = str(record.get("tx", "")).lower()
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if until > now and tx_hash:
+                    self.collection_cooldowns[str(key)] = {"until": until, "tx": tx_hash}
 
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
@@ -484,6 +517,16 @@ class Bot:
                 "pending": self.pending,
                 "paused": self.paused,
             }
+            lock = getattr(self, "_collection_lock", None)
+            now = time.time()
+            if lock:
+                with lock:
+                    cooldowns = dict(self.collection_cooldowns)
+            else:
+                cooldowns = dict(getattr(self, "collection_cooldowns", {}))
+            live = {k: v for k, v in cooldowns.items() if float(v.get("until", 0)) > now}
+            if live:
+                state["collection_cooldowns"] = live
             if self.watch_saved:
                 state["watch"] = sorted(self.watch)
             if self.cap_overrides:
@@ -543,6 +586,7 @@ class Bot:
             with self._watch_lock:
                 self.watch = updated
             self.watch_saved = True
+            self._watch_changed()
             self._save()
             lines.append("⏱ Changes take effect from the next scanned block; old mints are not replayed.")
         return "\n".join(lines)
@@ -567,6 +611,7 @@ class Bot:
             with self._watch_lock:
                 self.watch = updated
             self.watch_saved = True
+            self._watch_changed()
             self._save()
         return "\n".join(lines)
 
@@ -620,7 +665,8 @@ class Bot:
                 f"dry run: {dry}\n"
                 f"⛓ chains: {names}\n"
                 f"👀 watching {len(self.watch)} wallet(s), {len(self.minters)} minter(s)\n"
-                f"🔁 copies waiting to retry: {len(self.pending)}"
+                f"🔁 copies waiting to retry: {len(self.pending)}\n"
+                f"⚡ websocket live: {self._live_names()}"
             )
         if command == "/off":
             self.paused = True
@@ -1184,18 +1230,66 @@ class Bot:
         else:
             self.pending[key] = item
         self._save()
+        return len(done)
 
-    def logs_for(self, chain_id, start, end):
+    def claim_collection_cooldown(self, chain_id, tx_hash, want):
+        """Atomically reserve every collection in one source mint event.
+
+        A multi-collection transaction is one opportunity: if any collection is cooling
+        down from a different transaction, none are claimed and the whole event is
+        suppressed, so a transaction is never copied in part. The same source
+        transaction may continue through retry processing.
+        Returns (allowed, blocked), where blocked is a list of (key, seconds left).
+        """
+        if self.mint_cooldown_seconds <= 0 or not want:
+            return True, []
+        now = time.time()
+        tx_hash = str(tx_hash).lower()
+        keys = [f"{chain_id}:{collection.lower()}" for collection in want]
+        with self._collection_lock:
+            for key, record in list(self.collection_cooldowns.items()):
+                if float(record.get("until", 0)) <= now:
+                    self.collection_cooldowns.pop(key, None)
+            blocked = []
+            for key in keys:
+                record = self.collection_cooldowns.get(key)
+                if record and record.get("tx") != tx_hash:
+                    blocked.append((key, max(0, int(record["until"] - now))))
+            if not blocked:
+                expiry = now + self.mint_cooldown_seconds
+                for key in keys:
+                    record = self.collection_cooldowns.get(key)
+                    if not record or record.get("tx") != tx_hash:
+                        self.collection_cooldowns[key] = {"until": expiry, "tx": tx_hash}
+        if not blocked:
+            self._save()
+            return True, []
+        return False, blocked
+
+    def release_collection_cooldown(self, chain_id, tx_hash, want):
+        """Give back a claim when the copy never went through, so a later wallet can still trigger it."""
+        tx_hash = str(tx_hash).lower()
+        with self._collection_lock:
+            for collection in want:
+                key = f"{chain_id}:{collection.lower()}"
+                if (self.collection_cooldowns.get(key) or {}).get("tx") == tx_hash:
+                    del self.collection_cooldowns[key]
+        self._save()
+
+    def watch_topics(self):
+        """The three log filters that match a mint to any watched wallet."""
         with self._watch_lock:
             watched_addresses = list(self.watch)
         watched = ["0x" + word(addr) for addr in watched_addresses]
-        queries = [
+        return [
             [TRANSFER, ZERO_TOPIC, watched],
             [TRANSFER_SINGLE, None, ZERO_TOPIC, watched],
             [TRANSFER_BATCH, None, ZERO_TOPIC, watched],
         ]
+
+    def logs_for(self, chain_id, start, end):
         found = []
-        for topics in queries:
+        for topics in self.watch_topics():
             found.extend(
                 self.rpc.call(
                     chain_id,
@@ -1223,36 +1317,191 @@ class Bot:
             grouped.setdefault(entry["transactionHash"], []).append(entry)
         ordered = sorted(grouped.items(), key=lambda item: (as_int(item[1][0].get("blockNumber")), as_int(item[1][0].get("transactionIndex"))))
         for txh, logs in ordered:
-            want = self.minted_map(logs)
-            if not want:
-                continue
-            if f"{chain_id}:{txh}" in self.seen:
-                continue
+            self.handle_tx(chain_id, txh, logs)
+        return end
+
+    def handle_tx(self, chain_id, txh, logs):
+        """Copy one transaction if it is a mint by a watched wallet. Polling and the websocket both land here."""
+        want = self.minted_map(logs)
+        if not want:
+            return
+        key = f"{chain_id}:{txh}"
+        with self._copy_lock:
+            # Checked inside the lock, so a mint seen by both paths is copied once.
+            if key in self.seen:
+                return
             try:
                 tx = self.rpc.call(chain_id, "eth_getTransactionByHash", [txh])
             except Exception as exc:
                 log(f"tx {txh} {exc}")
-                continue
+                return
             if not tx or not tx.get("to"):
-                continue
+                return
             sender = (tx.get("from") or "").lower()
             if sender not in self.watch or sender in self.own:
-                continue
+                return
             if int(tx.get("value") or "0", 16) > self.cap(chain_id):
                 log(f"skip {txh} value {int(tx.get('value'), 16) / 1e18:.4f} over cap")
-                self.seen.add(f"{chain_id}:{txh}")
+                self.seen.add(key)
                 self._save()
-                continue
+                return
             if self.paused:
-                self.seen.add(f"{chain_id}:{txh}")
+                self.seen.add(key)
                 self._save()
                 alert(f"⏸ paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
-                continue
+                return
+            allowed, blocked = self.claim_collection_cooldown(chain_id, txh, want)
+            if not allowed:
+                names = ", ".join(item[0].split(":", 1)[1][:10] for item in blocked)
+                wait = max((item[1] for item in blocked), default=0)
+                log(f"skip {txh}: collection cooldown active for {names}; about {wait}s remaining")
+                self.seen.add(key)
+                self._save()
+                alert(f"⏭ duplicate collection mint suppressed on {self.chains[chain_id].name}: {names}; cooldown ~{wait}s")
+                return
             try:
-                self.copy(chain_id, tx, want)
+                finished = self.copy(chain_id, tx, want)
             except Exception as exc:
                 log(f"tx {txh} {exc}")
-        return end
+                return
+            if not finished and key not in self.pending:
+                # Nothing was minted and nothing is retrying, so do not hold the collection for nobody.
+                self.release_collection_cooldown(chain_id, txh, want)
+
+    def _live_names(self):
+        live = getattr(self, "ws_live", {})
+        names = [chain.name for cid, chain in self.chains.items() if live.get(cid)]
+        return ", ".join(names) if names else "none"
+
+    def _watch_changed(self):
+        """Tell the websocket threads to resubscribe, since their filters hold the old wallet list."""
+        self.watch_version = getattr(self, "watch_version", 0) + 1
+
+    def chains_due(self, now):
+        """Chains to poll this round. A chain with a live websocket is only polled as a backup."""
+        due = []
+        for cid in self.chains:
+            if self.ws_live.get(cid) and now - self.last_poll.get(cid, 0) < self.wss_backup:
+                continue
+            self.last_poll[cid] = now
+            due.append(cid)
+        return due
+
+    def ws_message(self, chain_id, raw):
+        """Handle one websocket frame. Only the first log of each transaction starts any work."""
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            return
+        if message.get("method") != "eth_subscription":
+            return
+        entry = (message.get("params") or {}).get("result") or {}
+        txh = entry.get("transactionHash")
+        if not txh or entry.get("removed"):
+            return
+        key = f"{chain_id}:{txh}"
+        with self._ws_lock:
+            if key in self._ws_recent or key in self.seen:
+                return
+            self._ws_recent[key] = None
+            if len(self._ws_recent) > 2000:
+                del self._ws_recent[next(iter(self._ws_recent))]
+        self._pool.submit(self.process_ws_tx, chain_id, txh)
+
+    def process_ws_tx(self, chain_id, txh):
+        """Read the whole receipt, so a mint of 10 NFTs is copied as 10 and not as the first log's 1."""
+        try:
+            receipt = None
+            for _ in range(5):
+                receipt = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+                if receipt:
+                    break
+                time.sleep(0.2)
+            if not receipt:
+                log(f"{self.chains[chain_id].name} no receipt yet for {txh}, the poll will catch it")
+                return
+            if as_int(receipt.get("status", "0x1")) != 1:
+                return
+            self.handle_tx(chain_id, txh, receipt.get("logs") or [])
+        except Exception as exc:
+            log(f"websocket tx {txh} {type(exc).__name__}: {exc}")
+
+    def ws_subscribe(self, ws, chain_id):
+        filters = self.watch_topics()
+        for number, topics in enumerate(filters, 1):
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": number, "method": "eth_subscribe", "params": ["logs", {"topics": topics}]}))
+        confirmed = 0
+        deadline = time.time() + 15
+        while confirmed < len(filters):
+            if time.time() > deadline:
+                raise RuntimeError("subscribe timed out")
+            raw = ws.recv()
+            if not raw:
+                raise ConnectionError("closed while subscribing")
+            message = json.loads(raw)
+            if message.get("error"):
+                raise RuntimeError(f"subscribe refused: {str(message['error'])[:120]}")
+            if message.get("id") in range(1, len(filters) + 1) and message.get("result"):
+                confirmed += 1
+            else:
+                self.ws_message(chain_id, raw)
+
+    def ws_loop(self, chain_id):
+        try:
+            import websocket  # the websocket-client package
+        except ImportError:
+            log("websocket-client is not installed, polling only")
+            return
+        chain = self.chains[chain_id]
+        delay = 1
+        failures = 0
+        while True:
+            version = self.watch_version
+            resubscribe = False
+            ws = None
+            try:
+                ws = websocket.create_connection(chain.wss, timeout=10)
+                ws.settimeout(5)
+                self.ws_subscribe(ws, chain_id)
+                self.ws_live[chain_id] = True
+                failures = 0
+                delay = 1
+                log(f"{chain.name} websocket live")
+                last_ping = time.time()
+                while True:
+                    if self.watch_version != version:
+                        log(f"{chain.name} watch list changed, resubscribing")
+                        resubscribe = True
+                        break
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        raw = None
+                    else:
+                        if not raw:
+                            raise ConnectionError("closed")
+                    if time.time() - last_ping > 20:
+                        ws.ping()
+                        last_ping = time.time()
+                    if raw:
+                        self.ws_message(chain_id, raw)
+            except Exception as exc:
+                # Only the error type is logged, since messages can carry the URL and its key.
+                log(f"{chain.name} websocket {type(exc).__name__}, polling covers it")
+                failures += 1
+                if failures == 5:
+                    notify(f"{chain.name} websocket keeps failing. The bot is polling that chain instead.")
+            finally:
+                self.ws_live[chain_id] = False
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+            if resubscribe:
+                continue
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
 
     def scan(self, chain_id):
         head = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
@@ -1291,7 +1540,8 @@ class Bot:
                 "value": hex(int(item["value"])),
             }
             try:
-                self.copy(chain_id, tx, {k.lower(): int(v) for k, v in item["want"].items()})
+                with self._copy_lock:
+                    self.copy(chain_id, tx, {k.lower(): int(v) for k, v in item["want"].items()})
             except Exception as exc:
                 log(f"retry {item['hash']} {exc}")
 
@@ -1310,8 +1560,13 @@ class Bot:
         if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
             threading.Thread(target=self.control_loop, daemon=True).start()
             log("telegram controls enabled")
+        streaming = [cid for cid, chain in self.chains.items() if chain.wss]
+        if streaming:
+            log(f"websocket mode on for {', '.join(self.chains[cid].name for cid in streaming)}; backup poll every {self.wss_backup:g}s")
+            for cid in streaming:
+                threading.Thread(target=self.ws_loop, args=(cid,), daemon=True).start()
         while True:
-            for cid in self.chains:
+            for cid in self.chains_due(time.time()):
                 try:
                     self.scan(cid)
                 except Exception as exc:
