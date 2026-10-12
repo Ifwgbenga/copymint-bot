@@ -1,6 +1,8 @@
 # Copymint bot
 
-Watches one or more wallets. When one of them successfully mints an NFT on any configured chain, your wallets send the same mint for the same quantity.
+Watches one or more wallets. When one of them mints an NFT to itself, your wallets send that same mint for the same quantity.
+
+A copy is taken from the mint call only, including a mint buried in a multicall. Signature and allowlist calls are skipped. The bot simulates the copy first and broadcasts only when that simulation mints the same collection and quantity. A send that does not land is retried. If it is still pending after two blocks, it is replaced once with a higher fee.
 
 If a minter does not have enough native coin on that chain, the bot swaps or bridges funds in with [LI.FI](https://li.quest) from another chain, then mints. A separate funder wallet can pay for the minters.
 

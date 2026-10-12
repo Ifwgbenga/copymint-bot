@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Watch wallets. When one mints an NFT, mint the same thing from yours.
+"""Watch wallets. When one mints an NFT to itself, mint the same quantity.
 
-Works on every chain in CHAINS. If a minter cannot pay the mint price and
-gas on that chain, funds are swapped or bridged in with LI.FI first.
-
-Signed allowlist mints cannot be copied: the signature is locked to the
-watched wallet. A copied call that reverts is skipped.
+The copy is the mint call only. Signature and allowlist calls are skipped.
+It is broadcast only when a simulation shows the minter receives the same
+collection and quantity. A send that does not land is retried, and the
+transaction is replaced once if it is still pending after two blocks.
 """
 
 from __future__ import annotations
@@ -24,8 +23,47 @@ from eth_utils import keccak, to_checksum_address
 
 TRANSFER = "0x" + keccak(text="Transfer(address,address,uint256)").hex()
 TRANSFER_SINGLE = "0x" + keccak(text="TransferSingle(address,address,address,uint256,uint256)").hex()
+TRANSFER_BATCH = "0x" + keccak(text="TransferBatch(address,address,address,uint256[],uint256[])").hex()
 ZERO_TOPIC = "0x" + "0" * 64
 LIFI = "https://li.quest/v1/quote"
+MAX_ATTEMPTS = 3
+LOG_CHUNK = 20
+
+
+def selector(signature):
+    return "0x" + keccak(text=signature).hex()[:8]
+
+
+MINT_OK = {
+    selector("mint(uint256)"),
+    selector("mint(address,uint256)"),
+    selector("mint(uint256,address)"),
+    selector("publicMint(uint256)"),
+    selector("mintPublic(address,address,address,uint256)"),
+    selector("claim(uint256)"),
+    selector("claim(address,uint256)"),
+    selector("purchase(uint256)"),
+}
+NON_MINT = {
+    selector("approve(address,uint256)"),
+    selector("transfer(address,uint256)"),
+    selector("transferFrom(address,address,uint256)"),
+    selector("setApprovalForAll(address,bool)"),
+    selector("deposit()"),
+    selector("withdraw(uint256)"),
+    selector("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))"),
+    selector("exactInput((bytes,address,uint256,uint256,uint256))"),
+    selector("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)"),
+    selector("swapExactETHForTokens(uint256,address[],address,uint256)"),
+    selector("execute(bytes,bytes[],uint256)"),
+}
+MULTICALL = {
+    selector("multicall(bytes[])"),
+    selector("multicall(uint256,bytes[])"),
+    selector("aggregate((address,bytes)[])"),
+    selector("aggregate3((address,bool,bytes)[])"),
+    selector("tryAggregate(bool,(address,bytes)[])"),
+}
 
 # token address, decimals. Native is the zero address.
 STABLES = {
@@ -61,8 +99,134 @@ def log(msg):
 def as_int(value):
     if isinstance(value, int):
         return value
+    if value in (None, "0x", ""):
+        return 0
     text = str(value)
     return int(text, 16) if text.startswith("0x") else int(text)
+
+
+def word_int(body, index):
+    return int.from_bytes(body[index : index + 32], "big")
+
+
+def read_bytes(body, offset):
+    length = word_int(body, offset)
+    start = offset + 32
+    return body[start : start + length]
+
+
+def decode_bytes_array(body, start):
+    count = word_int(body, start)
+    items = []
+    for i in range(count):
+        relative = word_int(body, start + 32 + 32 * i)
+        items.append(read_bytes(body, start + relative))
+    return items
+
+
+def decode_calls(body, start, with_bool=False):
+    count = word_int(body, start)
+    calls = []
+    for i in range(count):
+        relative = word_int(body, start + 32 + 32 * i)
+        # Offsets in a dynamic array are relative to the first offset word.
+        tuple_at = start + 32 + relative
+        target = "0x" + body[tuple_at + 12 : tuple_at + 32].hex()
+        head = tuple_at + 32
+        if with_bool:
+            head += 32
+        data = read_bytes(body, tuple_at + word_int(body, head))
+        calls.append((target, "0x" + data.hex()))
+    return calls
+
+
+def decode_multicall(data):
+    signature = data[:10].lower()
+    body = bytes.fromhex(data[10:])
+    if signature == selector("multicall(bytes[])"):
+        return [(None, "0x" + item.hex()) for item in decode_bytes_array(body, word_int(body, 0))]
+    if signature == selector("multicall(uint256,bytes[])"):
+        return [(None, "0x" + item.hex()) for item in decode_bytes_array(body, word_int(body, 32))]
+    if signature == selector("aggregate((address,bytes)[])"):
+        return decode_calls(body, word_int(body, 0), with_bool=False)
+    if signature == selector("aggregate3((address,bool,bytes)[])"):
+        return decode_calls(body, word_int(body, 0), with_bool=True)
+    if signature == selector("tryAggregate(bool,(address,bytes)[])"):
+        return decode_calls(body, word_int(body, 32), with_bool=False)
+    return []
+
+
+def expand_calls(target, data, value, depth=0):
+    signature = data[:10].lower() if len(data) >= 10 else ""
+    if depth < 3 and signature in MULTICALL:
+        try:
+            inners = decode_multicall(data)
+        except Exception:
+            inners = []
+        if inners:
+            found = []
+            for inner_target, inner_data in inners:
+                found.extend(expand_calls(inner_target or target, inner_data, value, depth + 1))
+            return found
+    return [(target, data, value)]
+
+
+def looks_signed(data):
+    if len(data) < 10:
+        return False
+    try:
+        body = bytes.fromhex(data[10:])
+    except ValueError:
+        return False
+    for index in range(0, max(0, len(body) - 96), 32):
+        if word_int(body, index) != 65:
+            continue
+        if index + 32 + 65 > len(body):
+            continue
+        if body[index + 32 + 64] in (0, 1, 27, 28):
+            return True
+    return False
+
+
+def single_qty(data):
+    if not data or len(data) < 2 + 128:
+        return 1
+    return int(data[2 + 64 : 2 + 128], 16)
+
+
+def batch_qty(data):
+    try:
+        body = bytes.fromhex(data[2:])
+        amounts_at = word_int(body, 32)
+        count = word_int(body, amounts_at)
+        total = 0
+        for i in range(count):
+            total += word_int(body, amounts_at + 32 + 32 * i)
+        return total
+    except Exception:
+        return 0
+
+
+def topic_address(topic):
+    return "0x" + topic[-40:]
+
+
+def collect_logs(node, found):
+    if isinstance(node, dict):
+        topics = node.get("topics")
+        address = node.get("address")
+        if isinstance(topics, list) and isinstance(address, str) and address.startswith("0x") and len(address) == 42 and "data" in node:
+            found.append(node)
+        for value in node.values():
+            collect_logs(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            collect_logs(value, found)
+
+
+def method_missing(exc):
+    text = str(exc).lower()
+    return "not found" in text or "not available" in text or "unsupported" in text or "32601" in text or "does not exist" in text
 
 
 @dataclass
@@ -154,6 +318,7 @@ class Bot:
                 log("no /data volume, using ./state.json")
         self.heads = {}
         self.seen = set()
+        self.pending = {}
         self._load()
 
     def _load(self):
@@ -161,11 +326,12 @@ class Bot:
             data = json.loads(self.state_path.read_text())
             self.heads = {int(k): int(v) for k, v in (data.get("heads") or {}).items()}
             self.seen = set(data.get("seen") or [])
+            self.pending = data.get("pending") or {}
 
     def _save(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"heads": self.heads, "seen": list(self.seen)[-5000:]}))
+        tmp.write_text(json.dumps({"heads": self.heads, "seen": list(self.seen)[-5000:], "pending": self.pending}))
         tmp.replace(self.state_path)
 
     def balance(self, chain_id, token, who):
@@ -177,9 +343,25 @@ class Bot:
     def gas_price(self, chain_id):
         return int(self.rpc.call(chain_id, "eth_gasPrice", []), 16)
 
-    def send(self, chain_id, acct, to, data="0x", value=0, gas=None):
-        base = self.gas_price(chain_id)
-        fee = max(int(base * 2), base + 1)
+    def fees(self, chain_id):
+        try:
+            hist = self.rpc.call(chain_id, "eth_feeHistory", ["0x5", "latest", [50]])
+            base = as_int(hist["baseFeePerGas"][-1])
+            tips = []
+            for row in hist.get("reward") or []:
+                if row and row[0] not in (None, "0x"):
+                    tips.append(as_int(row[0]))
+            tip = max(tips) if tips else max(base // 10, 1)
+        except Exception:
+            base = self.gas_price(chain_id)
+            tip = max(base // 10, 1)
+        if tip < 1:
+            tip = 1
+        return base * 2 + tip, min(tip, base * 2 + tip)
+
+    def send(self, chain_id, acct, to, data="0x", value=0, gas=None, fee=None, tip=None, nonce=None, wait=True):
+        if fee is None or tip is None:
+            fee, tip = self.fees(chain_id)
         if gas is None:
             est = int(
                 self.rpc.call(
@@ -197,14 +379,15 @@ class Bot:
         if self.dry:
             log(f"DRY {acct.address[:8]} {self.chains[chain_id].name} value {value} gas {gas}")
             return "dry", True
-        nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+        if nonce is None:
+            nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
         signed = acct.sign_transaction(
             {
                 "chainId": chain_id,
                 "nonce": nonce,
                 "gas": gas,
                 "maxFeePerGas": fee,
-                "maxPriorityFeePerGas": min(fee, max(base, 1)),
+                "maxPriorityFeePerGas": tip,
                 "to": to_checksum_address(to),
                 "value": value,
                 "data": data,
@@ -212,11 +395,40 @@ class Bot:
             }
         )
         txh = self.rpc.call(chain_id, "eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()])
+        if not wait:
+            return txh, False
         for _ in range(40):
             rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
             if rec:
                 return txh, int(rec["status"], 16) == 1
             time.sleep(0.5)
+        return txh, False
+
+    def land(self, chain_id, acct, to, data, value, gas):
+        fee, tip = self.fees(chain_id)
+        nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+        start = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+        txh, ok = self.send(chain_id, acct, to, data, value, gas, fee, tip, nonce, wait=False)
+        if self.dry:
+            return txh, True
+        bumped = False
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+            if rec:
+                return txh, int(rec["status"], 16) == 1
+            now = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+            if not bumped and now >= start + 2:
+                bumped = True
+                new_fee = max(int(fee * 2), fee + 1)
+                new_tip = min(max(int(tip * 2), tip + 1), new_fee)
+                try:
+                    txh, ok = self.send(chain_id, acct, to, data, value, gas, new_fee, new_tip, nonce, wait=False)
+                    log(f"replaced {acct.address[:8]} {txh}")
+                except Exception as exc:
+                    if "nonce" not in str(exc).lower():
+                        log(f"replace {acct.address[:8]} {exc}")
+            time.sleep(0.6)
         return txh, False
 
     def lifi_quote(self, src, dst, token, amount, sender, recipient):
@@ -296,8 +508,7 @@ class Bot:
             return True
         if not self.bridge:
             return False
-        before = self.balance(chain_id, "native", minter.address)
-        short = need - before
+        short = need - self.balance(chain_id, "native", minter.address)
         holders = [minter]
         if self.funder and self.funder.address.lower() != minter.address.lower():
             holders.append(self.funder)
@@ -326,63 +537,312 @@ class Bot:
                     log(f"bridge timed out for {minter.address[:8]}")
         return self.balance(chain_id, "native", minter.address) >= need
 
-    def is_mint(self, chain_id, tx):
-        if not tx.get("to"):
-            return False
-        sender = (tx.get("from") or "").lower()
-        if sender not in self.watch or sender in self.own:
-            return False
-        value = int(tx.get("value") or "0", 16)
-        if value > self.max_value:
-            log(f"skip {tx['hash']} value {value / 1e18:.4f} over cap")
-            return False
-        rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [tx["hash"]])
-        if not rec or int(rec["status"], 16) != 1:
-            return False
-        minted = 0
-        for entry in rec["logs"]:
-            topics = [t.lower() for t in entry.get("topics") or []]
-            if len(topics) >= 3 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
-                minted += 1
-            elif len(topics) >= 4 and topics[0] == TRANSFER_SINGLE and topics[2] == ZERO_TOPIC:
-                minted += 1
-        if minted <= 0:
-            return False
-        return True
+    def rewrite_watched(self, data, new):
+        for old in self.watch:
+            data = rewrite(data, old, new)
+        return data
 
-    def copy(self, chain_id, tx):
-        key = f"{chain_id}:{tx['hash']}"
-        if key in self.seen:
-            return
-        self.seen.add(key)
-        self._save()
-        sender = to_checksum_address(tx["from"])
-        value = int(tx.get("value") or "0", 16)
-        chain = self.chains[chain_id]
-        log(f"mint by {sender} on {chain.name} -> {tx['to']} value {value / 1e18:.6f} {tx['hash']}")
-        for acct in self.minters:
-            data = rewrite(tx["input"], sender, acct.address)
-            try:
+    def minted_map(self, logs):
+        totals = {}
+        for entry in logs:
+            topics = [t.lower() for t in entry.get("topics") or []]
+            collection = entry.get("address", "").lower()
+            qty = 0
+            if len(topics) >= 3 and topics[0] == TRANSFER and topics[1] == ZERO_TOPIC:
+                if topic_address(topics[2]) in self.watch:
+                    qty = 1
+            elif len(topics) >= 4 and topics[0] == TRANSFER_SINGLE and topics[2] == ZERO_TOPIC:
+                if topic_address(topics[3]) in self.watch:
+                    qty = single_qty(entry.get("data") or "0x")
+            elif len(topics) >= 4 and topics[0] == TRANSFER_BATCH and topics[2] == ZERO_TOPIC:
+                if topic_address(topics[3]) in self.watch:
+                    qty = batch_qty(entry.get("data") or "0x")
+            if qty > 0 and collection:
+                totals[collection] = totals.get(collection, 0) + qty
+        return totals
+
+    def minted_for(self, logs, recipient):
+        recip = recipient.lower()
+        totals = {}
+        saved = self.watch
+        self.watch = {recip}
+        try:
+            totals = self.minted_map(logs)
+        finally:
+            self.watch = saved
+        return totals
+
+    def simulate(self, chain_id, acct, target, data, value):
+        call = {
+            "from": acct.address,
+            "to": to_checksum_address(target),
+            "data": data,
+            "value": hex(value),
+            "gas": hex(1_500_000),
+        }
+        try:
+            result = self.rpc.call(
+                chain_id,
+                "eth_simulateV1",
+                [{"blockStateCalls": [{"calls": [call]}], "validation": False, "traceTransfers": True}, "latest"],
+            )
+            status = 1
+            gas_used = 0
+            if isinstance(result, list) and result and isinstance(result[0], dict):
+                calls = result[0].get("calls") or []
+                if calls:
+                    if calls[0].get("error"):
+                        status = 0
+                    elif calls[0].get("status") is not None:
+                        status = as_int(calls[0].get("status"))
+                    gas_used = as_int(calls[0].get("gasUsed"))
+            if status == 0:
+                return None
+            logs = []
+            collect_logs(result, logs)
+            return logs, gas_used or 400_000
+        except Exception as exc:
+            if not method_missing(exc):
+                text = str(exc).lower()
+                if "revert" in text or "execution" in text:
+                    return None
+                if not method_missing(exc):
+                    log(f"simulate {exc}")
+                    return None
+        try:
+            result = self.rpc.call(
+                chain_id,
+                "debug_traceCall",
+                [call, "latest", {"tracer": "callTracer", "tracerConfig": {"withLog": True}}],
+            )
+        except Exception as exc:
+            if method_missing(exc):
+                return "unsupported"
+            if "revert" in str(exc).lower():
+                return None
+            return "unsupported"
+        if isinstance(result, dict) and result.get("error"):
+            return None
+        logs = []
+        collect_logs(result, logs)
+        gas_used = as_int(result.get("gasUsed")) if isinstance(result, dict) else 0
+        if not logs:
+            return "unsupported"
+        return logs, gas_used or 400_000
+
+    def candidates(self, tx):
+        calls = expand_calls(tx["to"], tx.get("input") or "0x", int(tx.get("value") or "0", 16))
+        kept = []
+        for target, data, value in calls:
+            if len(data) < 10:
+                continue
+            if data[:10].lower() in NON_MINT or looks_signed(data):
+                continue
+            kept.append((target, data, value))
+        return kept
+
+    def fallback(self, chain_id, acct, options, want):
+        simple = []
+        for target, data, value in options:
+            signature = data[:10].lower()
+            if signature in MINT_OK or target.lower() in want:
+                simple.append((target, self.rewrite_watched(data, acct.address), value))
+        if len(simple) != 1:
+            return None
+        target, data, value = simple[0]
+        if value > self.max_value:
+            value = 0
+        try:
+            est = int(
                 self.rpc.call(
                     chain_id,
                     "eth_estimateGas",
-                    [{"from": acct.address, "to": tx["to"], "data": data, "value": hex(value)}],
-                )
-            except Exception as exc:
-                log(f"skip {acct.address[:8]} simulation {exc}")
+                    [{"from": acct.address, "to": target, "data": data, "value": hex(value)}],
+                ),
+                16,
+            )
+        except Exception:
+            return None
+        log(f"{acct.address[:8]} RPC cannot show mint logs, using the gas estimate")
+        return value, target, data, est
+
+    def pick(self, chain_id, acct, options, want):
+        saw_real = False
+        unsupported = False
+        best = None
+        for target, raw, hinted in options:
+            data = self.rewrite_watched(raw, acct.address)
+            values = []
+            for value in (0, hinted):
+                if value not in values and value <= self.max_value:
+                    values.append(value)
+            for value in values:
+                result = self.simulate(chain_id, acct, target, data, value)
+                if result == "unsupported":
+                    unsupported = True
+                    continue
+                saw_real = True
+                if not result:
+                    continue
+                logs, gas_used = result
+                if self.minted_for(logs, acct.address) != want:
+                    continue
+                if best is None or value < best[0]:
+                    best = (value, target, data, max(gas_used, 80_000))
+                break
+        if best:
+            return best
+        if not saw_real and unsupported:
+            return self.fallback(chain_id, acct, options, want)
+        return None
+
+    def copy(self, chain_id, tx, want):
+        key = f"{chain_id}:{tx['hash']}"
+        if key in self.seen:
+            return
+        item = self.pending.get(key) or {
+            "chain": chain_id,
+            "hash": tx["hash"],
+            "from": tx["from"],
+            "to": tx["to"],
+            "input": tx.get("input") or "0x",
+            "value": int(tx.get("value") or "0", 16),
+            "want": want,
+            "attempts": 0,
+            "done": [],
+            "inflight": {},
+        }
+        options = self.candidates(tx)
+        chain = self.chains[chain_id]
+        qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
+        if item["attempts"] == 0:
+            log(f"mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
+        if not options:
+            log(f"skip {tx['hash']} no mint call")
+            self.seen.add(key)
+            self.pending.pop(key, None)
+            self._save()
+            return
+        item["attempts"] = int(item.get("attempts") or 0) + 1
+        temporary = False
+        done = set(a.lower() for a in item.get("done") or [])
+        inflight = item.get("inflight") or {}
+        for acct in self.minters:
+            who = acct.address.lower()
+            if who in done:
                 continue
-            base = self.gas_price(chain_id)
-            # A copied mint is usually under 400k gas. Fund a little extra.
-            need = value + 500_000 * max(int(base * 2), base + 1)
-            if not self.ensure(acct, chain_id, need):
+            previous = inflight.get(who)
+            if previous:
+                rec = self.rpc.call(chain_id, "eth_getTransactionReceipt", [previous])
+                if rec is None:
+                    temporary = True
+                    continue
+                inflight.pop(who, None)
+                if int(rec["status"], 16) == 1:
+                    done.add(who)
+                    log(f"OK {acct.address} {previous}")
+                    continue
+            chosen = self.pick(chain_id, acct, options, want)
+            if not chosen:
+                log(f"skip {acct.address[:8]} simulation does not match {qty}")
+                continue
+            value, target, data, gas_used = chosen
+            gas = int(gas_used * 1.25) + 20_000
+            fee, _tip = self.fees(chain_id)
+            if not self.ensure(acct, chain_id, value + gas * fee):
                 log(f"skip {acct.address[:8]} not enough on {chain.name} and no route")
+                temporary = True
                 continue
             try:
-                txh, ok = self.send(chain_id, acct, tx["to"], data, value)
+                txh, ok = self.land(chain_id, acct, target, data, value, gas)
             except Exception as exc:
                 log(f"send {acct.address[:8]} {exc}")
+                temporary = True
                 continue
-            log(f"{'OK' if ok else 'FAIL'} {acct.address} {txh}")
+            if ok:
+                done.add(who)
+                log(f"OK {acct.address} {txh}")
+            else:
+                inflight[who] = txh
+                temporary = True
+                log(f"pending {acct.address} {txh}")
+        item["done"] = sorted(done)
+        item["inflight"] = inflight
+        if len(done) == len(self.minters) or (not temporary and item["attempts"] >= 1 and len(done) == len(self.minters)):
+            self.seen.add(key)
+            self.pending.pop(key, None)
+        elif not temporary:
+            self.seen.add(key)
+            self.pending.pop(key, None)
+        elif item["attempts"] >= MAX_ATTEMPTS:
+            log(f"giving up {tx['hash']} after {item['attempts']} attempts")
+            self.seen.add(key)
+            self.pending.pop(key, None)
+        else:
+            self.pending[key] = item
+        self._save()
+
+    def logs_for(self, chain_id, start, end):
+        watched = ["0x" + word(addr) for addr in self.watch]
+        queries = [
+            [TRANSFER, ZERO_TOPIC, watched],
+            [TRANSFER_SINGLE, None, ZERO_TOPIC, watched],
+            [TRANSFER_BATCH, None, ZERO_TOPIC, watched],
+        ]
+        found = []
+        for topics in queries:
+            found.extend(
+                self.rpc.call(
+                    chain_id,
+                    "eth_getLogs",
+                    [{"fromBlock": hex(start), "toBlock": hex(end), "topics": topics}],
+                )
+                or []
+            )
+        return found
+
+    def take_range(self, chain_id, start, end):
+        try:
+            entries = self.logs_for(chain_id, start, end)
+        except Exception as exc:
+            if start == end:
+                log(f"{self.chains[chain_id].name} skip block {start} {exc}")
+                return end
+            mid = (start + end) // 2
+            reached = self.take_range(chain_id, start, mid)
+            if reached < mid:
+                return reached
+            return self.take_range(chain_id, mid + 1, end)
+        grouped = {}
+        for entry in entries:
+            grouped.setdefault(entry["transactionHash"], []).append(entry)
+        ordered = sorted(grouped.items(), key=lambda item: (as_int(item[1][0].get("blockNumber")), as_int(item[1][0].get("transactionIndex"))))
+        for txh, logs in ordered:
+            want = self.minted_map(logs)
+            if not want:
+                continue
+            if f"{chain_id}:{txh}" in self.seen:
+                continue
+            try:
+                tx = self.rpc.call(chain_id, "eth_getTransactionByHash", [txh])
+            except Exception as exc:
+                log(f"tx {txh} {exc}")
+                continue
+            if not tx or not tx.get("to"):
+                continue
+            sender = (tx.get("from") or "").lower()
+            if sender not in self.watch or sender in self.own:
+                continue
+            if int(tx.get("value") or "0", 16) > self.max_value:
+                log(f"skip {txh} value {int(tx.get('value'), 16) / 1e18:.4f} over cap")
+                self.seen.add(f"{chain_id}:{txh}")
+                self._save()
+                continue
+            try:
+                self.copy(chain_id, tx, want)
+            except Exception as exc:
+                log(f"tx {txh} {exc}")
+        return end
 
     def scan(self, chain_id):
         head = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
@@ -392,24 +852,36 @@ class Bot:
             self._save()
             log(f"{self.chains[chain_id].name} watching from {head}")
             return
+        if head < last:
+            last = head - 1
         if head <= last:
             return
-        start = last + 1
-        if head - start > 40:
-            log(f"{self.chains[chain_id].name} behind {head - start} blocks, skipping to {head - 40}")
-            start = head - 40
-        for number in range(start, head + 1):
-            block = self.rpc.call(chain_id, "eth_getBlockByNumber", [hex(number), True])
-            for tx in (block or {}).get("transactions") or []:
-                if isinstance(tx, str):
-                    continue
-                try:
-                    if self.is_mint(chain_id, tx):
-                        self.copy(chain_id, tx)
-                except Exception as exc:
-                    log(f"tx {tx.get('hash')} {exc}")
-            self.heads[chain_id] = number
-        self._save()
+        cursor = last + 1
+        while cursor <= head:
+            end = min(head, cursor + LOG_CHUNK - 1)
+            reached = self.take_range(chain_id, cursor, end)
+            self.heads[chain_id] = reached
+            self._save()
+            if reached < end:
+                break
+            cursor = reached + 1
+
+    def retry_pending(self):
+        for key, item in list(self.pending.items()):
+            chain_id = int(item["chain"])
+            if chain_id not in self.chains:
+                continue
+            tx = {
+                "hash": item["hash"],
+                "from": item["from"],
+                "to": item["to"],
+                "input": item["input"],
+                "value": hex(int(item["value"])),
+            }
+            try:
+                self.copy(chain_id, tx, {k.lower(): int(v) for k, v in item["want"].items()})
+            except Exception as exc:
+                log(f"retry {item['hash']} {exc}")
 
     def run(self):
         names = ", ".join(c.name for c in self.chains.values())
@@ -424,6 +896,10 @@ class Bot:
                     self.scan(cid)
                 except Exception as exc:
                     log(f"{self.chains[cid].name} {exc}")
+            try:
+                self.retry_pending()
+            except Exception as exc:
+                log(f"retry {exc}")
             time.sleep(self.poll)
 
 
