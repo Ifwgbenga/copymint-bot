@@ -439,7 +439,6 @@ class Bot:
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
             if isinstance(saved_watch, list) and saved_watch:
-                # Re-validate persisted data before trusting it.
                 clean = {a.lower() for a in saved_watch if valid_address(str(a))}
                 clean.difference_update(self.own)
                 if clean:
@@ -455,7 +454,6 @@ class Bot:
                     self.cap_overrides[cid] = value
 
     def _save(self):
-        # Both the scanner and Telegram control loop can save state.
         with self._state_lock:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_path.with_suffix(".tmp")
@@ -555,8 +553,6 @@ class Bot:
         txh, ok = self.send(chain_id, acct, to, data, value, gas, fee, tip, nonce, wait=False)
         if self.dry:
             return txh, True, [txh]
-        # Keep every hash sent for this nonce. Either the original or the
-        # replacement can land, so both have to be watched for a receipt.
         sent = [txh]
         bumped = False
         deadline = time.time() + 90
@@ -914,7 +910,6 @@ class Bot:
                 continue
             previous = inflight.get(who)
             if previous:
-                # Older state files hold one hash as a string, newer ones a list.
                 hashes = [previous] if isinstance(previous, str) else list(previous)
                 hit = self.receipt_for(chain_id, hashes)
                 if hit is None:
@@ -1135,7 +1130,6 @@ class Bot:
         chat_id = env("TELEGRAM_CHAT_ID")
         offset = None
         try:
-            # Ignore commands sent before this process started.
             first = telegram_call("getUpdates", {"offset": -1, "timeout": 0}, timeout=15)
             updates = first.get("result") or []
             if updates:
