@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -74,6 +75,18 @@ class TelegramControls(unittest.TestCase):
         with mock.patch.object(instance, "command_reply") as reply:
             instance.handle_command({"message": {"chat": {"id": 99}, "text": "/off"}}, "123")
             reply.assert_not_called()
+
+    def test_slash_menu_is_registered_with_telegram(self):
+        env = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "42"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(bot.urllib.request, "urlopen") as urlopen:
+            response = mock.Mock()
+            response.read.return_value = b'{"ok": true, "result": true}'
+            urlopen.return_value.__enter__.return_value = response
+            bot.publish_commands()
+        request = urlopen.call_args[0][0]
+        self.assertTrue(request.full_url.endswith("/setMyCommands"))
+        for name, _text in bot.MENU:
+            self.assertIn(name.encode(), request.data)
 
 
 if __name__ == "__main__":

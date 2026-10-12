@@ -85,7 +85,7 @@ Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot messages you when it
 
 ## Telegram controls
 
-With the same two variables set, you can control the bot from the chat:
+With the same two variables set, type `/` in the chat with the bot. Telegram shows the command menu, so you do not have to type the names. The menu is registered when the bot starts. Redeploy after pulling this version, then open the chat and type `/`.
 
 | Command | What it does |
 |---|---|

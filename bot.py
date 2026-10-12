@@ -139,6 +139,26 @@ def alert(msg):
     notify(msg)
 
 
+MENU = (
+    ("status", "📡 Copying, dry run, and wallets"),
+    ("off", "⏸ Pause copying"),
+    ("on", "▶️ Resume copying"),
+    ("wallets", "👀 List watched wallets"),
+    ("watch", "➕ Add a wallet address"),
+    ("unwatch", "➖ Remove a watched wallet"),
+    ("minters", "👛 Minter and funder addresses"),
+    ("balance", "💰 Native balance on each chain"),
+    ("cap", "🎯 Show or set the mint cap"),
+    ("help", "ℹ️ List every command"),
+)
+
+
+def publish_commands():
+    """Register the slash menu. Telegram shows it when the user types /."""
+    commands = [{"command": name, "description": text} for name, text in MENU]
+    telegram_call("setMyCommands", {"commands": json.dumps(commands)})
+
+
 def telegram_call(method, params=None, timeout=35):
     """Call the Telegram Bot API without logging the token-bearing URL."""
     token = env("TELEGRAM_BOT_TOKEN")
@@ -486,63 +506,63 @@ class Bot:
             rows = list(pool.map(fetch, jobs))
         lines = []
         for index, account in enumerate(accounts):
-            label = "funder" if self.funder is not None and account is self.funder else "minter"
+            label = "🏦 funder" if self.funder is not None and account is self.funder else "👛 minter"
             lines.append(f"{label} {short_address(account.address)}")
             for row_index, cid, balance in rows:
                 if row_index == index:
                     amount = "n/a" if balance is None else f"{balance / 1e18:.4f}"
-                    lines.append(f"  {self.chains[cid].name}: {amount}")
-        return "\n".join(lines) or "No minter or funder wallets configured."
+                    lines.append(f"  • {self.chains[cid].name}: {amount}")
+        return "\n".join(lines) or "📭 No minter or funder wallets configured."
 
     def wallets_text(self):
         wallets = sorted(self.watch)
         source = "saved list" if self.watch_saved else "WATCH_ADDRESSES"
-        return f"Watching {len(wallets)} wallet(s) ({source}):\n" + "\n".join(
-            to_checksum_address(address) for address in wallets
+        return f"👀 Watching {len(wallets)} wallet(s) ({source}):\n" + "\n".join(
+            "• " + to_checksum_address(address) for address in wallets
         )
 
     def watch_command(self, args):
         if not args:
-            return "Usage: /watch 0xADDRESS [0xADDRESS ...]"
+            return "✏️ Usage: /watch 0xADDRESS [0xADDRESS ...]"
         updated = set(self.watch)
         lines = []
         for raw in args:
             address = valid_address(raw)
             if address is None:
-                lines.append(f"{raw[:12]}: invalid EVM address")
+                lines.append(f"⚠️ {raw[:12]}: invalid EVM address")
             elif address in self.own:
-                lines.append(f"{short_address(address)}: one of your own wallets; not added")
+                lines.append(f"🚫 {short_address(address)}: one of your own wallets; not added")
             elif address in updated:
-                lines.append(f"{short_address(address)}: already watched")
+                lines.append(f"👀 {short_address(address)}: already watched")
             elif len(updated) >= MAX_WATCH:
-                lines.append(f"{short_address(address)}: limit of {MAX_WATCH} watched wallets reached")
+                lines.append(f"⛔ {short_address(address)}: limit of {MAX_WATCH} watched wallets reached")
             else:
                 updated.add(address)
-                lines.append(f"{short_address(address)}: added")
+                lines.append(f"✅ {short_address(address)}: added")
         if updated != self.watch:
             with self._watch_lock:
                 self.watch = updated
             self.watch_saved = True
             self._save()
-            lines.append("Changes take effect from the next scanned block; old mints are not replayed.")
+            lines.append("⏱ Changes take effect from the next scanned block; old mints are not replayed.")
         return "\n".join(lines)
 
     def unwatch_command(self, args):
         if not args:
-            return "Usage: /unwatch 0xADDRESS [0xADDRESS ...]"
+            return "✏️ Usage: /unwatch 0xADDRESS [0xADDRESS ...]"
         updated = set(self.watch)
         lines = []
         for raw in args:
             address = valid_address(raw)
             if address is None:
-                lines.append(f"{raw[:12]}: invalid EVM address")
+                lines.append(f"⚠️ {raw[:12]}: invalid EVM address")
             elif address not in updated:
-                lines.append(f"{short_address(address)}: not currently watched")
+                lines.append(f"🔍 {short_address(address)}: not currently watched")
             elif len(updated) <= 1:
-                lines.append(f"{short_address(address)}: cannot remove the last watched wallet; use /off")
+                lines.append(f"🔒 {short_address(address)}: cannot remove the last watched wallet; use /off")
             else:
                 updated.remove(address)
-                lines.append(f"{short_address(address)}: removed")
+                lines.append(f"✅ {short_address(address)}: removed")
         if updated != self.watch:
             with self._watch_lock:
                 self.watch = updated
@@ -552,22 +572,22 @@ class Bot:
 
     def cap_command(self, args):
         if not args:
-            rows = [f"{chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
+            rows = [f"• {chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
             return (
-                "Mint value caps in each chain's native coin:\n"
+                "🎯 Mint value caps in each chain's native coin:\n"
                 + "\n".join(rows)
-                + "\nSet one: /cap 56 0.1 | Set all: /cap all 0.05"
+                + "\nSet one: /cap 56 0.1\nSet all: /cap all 0.05"
             )
         if len(args) != 2:
-            return "Usage: /cap CHAIN_ID AMOUNT or /cap all AMOUNT"
+            return "✏️ Usage: /cap CHAIN_ID AMOUNT or /cap all AMOUNT"
         target, amount_text = args
         try:
             amount = Decimal(amount_text)
         except Exception:
-            return "Amount must be a number."
+            return "⚠️ Amount must be a number."
         if not amount.is_finite() or amount < 0 or amount > CAP_COMMAND_LIMIT:
             return (
-                f"Amount must be between 0 and {CAP_COMMAND_LIMIT}. "
+                f"⚠️ Amount must be between 0 and {CAP_COMMAND_LIMIT}. "
                 "For a higher cap, edit MAX_MINT_ETH or MAX_MINT_<chainId>."
             )
         if target.lower() == "all":
@@ -576,25 +596,31 @@ class Bot:
             try:
                 cid = int(target)
             except ValueError:
-                return "Chain ID must be an integer or 'all'."
+                return "⚠️ Chain ID must be an integer or 'all'."
             if cid not in self.chains:
-                return f"Chain {cid} is not enabled."
+                return f"⚠️ Chain {cid} is not enabled."
             chain_ids = [cid]
         value = to_wei(amount_text)
         for cid in chain_ids:
             self.max_values[cid] = value
             self.cap_overrides[cid] = value
         self._save()
-        return f"Cap set to {amount_text} on " + ", ".join(self.chains[cid].name for cid in chain_ids)
+        return "✅ Cap set to {amount} on {names}".format(
+            amount=amount_text,
+            names=", ".join(self.chains[cid].name for cid in chain_ids),
+        )
 
     def command_reply(self, command, args=()):
         if command == "/status":
             names = ", ".join(chain.name for chain in self.chains.values())
+            state = "⏸ PAUSED" if self.paused else "🟢 ON"
+            dry = "🧪 on" if self.dry else "off"
             return (
-                f"copymint is {'PAUSED' if self.paused else 'ON'}\n"
-                f"dry run: {'on' if self.dry else 'off'}\nchains: {names}\n"
-                f"watching {len(self.watch)} wallet(s), {len(self.minters)} minter(s)\n"
-                f"copies waiting to retry: {len(self.pending)}"
+                f"copymint is {state}\n"
+                f"dry run: {dry}\n"
+                f"⛓ chains: {names}\n"
+                f"👀 watching {len(self.watch)} wallet(s), {len(self.minters)} minter(s)\n"
+                f"🔁 copies waiting to retry: {len(self.pending)}"
             )
         if command == "/off":
             self.paused = True
@@ -602,11 +628,11 @@ class Bot:
                 self.seen.add(key)
             self.pending.clear()
             self._save()
-            return "Paused. New mints will be skipped, and pending retries have been dropped. Use /on to resume."
+            return "⏸ Paused. New mints will be skipped, and pending retries have been dropped. Use /on to resume."
         if command == "/on":
             self.paused = False
             self._save()
-            return "Resumed. Only mints seen from now on will be copied; paused mints are not replayed."
+            return "▶️ Resumed. Only mints seen from now on will be copied; paused mints are not replayed."
         if command == "/wallets":
             return self.wallets_text()
         if command == "/watch":
@@ -614,19 +640,18 @@ class Bot:
         if command == "/unwatch":
             return self.unwatch_command(args)
         if command == "/minters":
-            lines = [f"minter {account.address}" for account in self.minters]
+            lines = [f"👛 minter {account.address}" for account in self.minters]
             if self.funder:
-                lines.append(f"funder {self.funder.address}")
-            return "\n".join(lines)
+                lines.append(f"🏦 funder {self.funder.address}")
+            return "\n".join(lines) or "📭 No minter wallets configured."
         if command == "/balance":
             return self.balances_text()
         if command == "/cap":
             return self.cap_command(args)
         if command in ("/help", "/start"):
-            return (
-                "Commands:\n/status\n/off\n/on\n/wallets\n/watch 0xADDRESS\n"
-                "/unwatch 0xADDRESS\n/minters\n/balance\n/cap [CHAIN_ID AMOUNT]"
-            )
+            lines = ["Tap / to open the menu.\n"]
+            lines.extend(f"/{name}  {text}" for name, text in MENU)
+            return "\n".join(lines)
         return None
 
     def handle_command(self, update, chat_id):
@@ -643,6 +668,11 @@ class Bot:
 
     def control_loop(self):
         chat_id = env("TELEGRAM_CHAT_ID")
+        try:
+            publish_commands()
+            log("telegram command menu registered")
+        except Exception as exc:
+            log(f"telegram command menu failed: {type(exc).__name__}")
         offset = None
         try:
             # Ignore commands sent before this process started.
@@ -901,7 +931,7 @@ class Bot:
                     if self.balance(chain_id, "native", minter.address) >= need:
                         return True
                     time.sleep(3)
-                alert(f"bridge timed out for {minter.address[:8]} on {self.chains[chain_id].name}")
+                alert(f"🌉 bridge timed out for {minter.address[:8]} on {self.chains[chain_id].name}")
         return self.balance(chain_id, "native", minter.address) >= need
 
     def rewrite_watched(self, data, new):
@@ -1087,7 +1117,7 @@ class Bot:
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:
-            alert(f"mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
+            alert(f"🎯 mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
         if not options:
             log(f"skip {tx['hash']} no mint call")
             self.seen.add(key)
@@ -1113,7 +1143,7 @@ class Bot:
                 inflight.pop(who, None)
                 if hit[1]:
                     done.add(who)
-                    alert(f"OK {acct.address} {hit[0]}")
+                    alert(f"✅ OK {acct.address} {hit[0]}")
                     continue
             chosen = self.pick(chain_id, acct, options, want)
             if not chosen:
@@ -1123,7 +1153,7 @@ class Bot:
             gas = int(gas_used * 1.25) + 20_000
             fee, _tip = self.fees(chain_id)
             if not self.ensure(acct, chain_id, value + gas * fee):
-                alert(f"skip {acct.address[:8]} not enough on {chain.name} and no route")
+                alert(f"💸 skip {acct.address[:8]} not enough on {chain.name} and no route")
                 temporary = True
                 continue
             try:
@@ -1135,9 +1165,9 @@ class Bot:
             if ok:
                 done.add(who)
                 if self.dry:
-                    alert(f"DRY {acct.address} would mint on {chain.name}, not broadcast")
+                    alert(f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast")
                 else:
-                    alert(f"OK {acct.address} {txh}")
+                    alert(f"✅ OK {acct.address} {txh}")
             else:
                 inflight[who] = sent
                 temporary = True
@@ -1148,7 +1178,7 @@ class Bot:
             self.seen.add(key)
             self.pending.pop(key, None)
         elif item["attempts"] >= MAX_ATTEMPTS:
-            alert(f"giving up {tx['hash']} after {item['attempts']} attempts")
+            alert(f"🛑 giving up {tx['hash']} after {item['attempts']} attempts")
             self.seen.add(key)
             self.pending.pop(key, None)
         else:
@@ -1216,7 +1246,7 @@ class Bot:
             if self.paused:
                 self.seen.add(f"{chain_id}:{txh}")
                 self._save()
-                alert(f"paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
+                alert(f"⏸ paused; skipped mint by {sender} on {self.chains[chain_id].name} {txh}")
                 continue
             try:
                 self.copy(chain_id, tx, want)
@@ -1272,9 +1302,10 @@ class Bot:
         if self.funder:
             log(f"funder {self.funder.address}")
         log(f"bridge {'on' if self.bridge else 'off'} dry {'on' if self.dry else 'off'}")
+        state = "⏸ PAUSED" if self.paused else "🟢 on"
         notify(
-            f"copymint-bot started ({'PAUSED' if self.paused else 'on'}): {len(self.watch)} wallet(s) on {names}, "
-            f"dry run {'on' if self.dry else 'off'}"
+            f"🤖 copymint-bot started ({state}): {len(self.watch)} wallet(s) on {names}, "
+            f"dry run {'🧪 on' if self.dry else 'off'}"
         )
         if env("TELEGRAM_BOT_TOKEN") and env("TELEGRAM_CHAT_ID"):
             threading.Thread(target=self.control_loop, daemon=True).start()
