@@ -476,7 +476,7 @@ class Bot:
         self.seen = SeenSet()
         self.pending = {}
         try:
-            self.mint_cooldown_seconds = max(0, int(env("MINT_COOLDOWN_SECONDS", "300")))
+            self.mint_cooldown_seconds = max(0, int(env("MINT_COOLDOWN_SECONDS", "0")))
         except ValueError as exc:
             raise SystemExit("MINT_COOLDOWN_SECONDS must be a non-negative integer") from exc
         # One cooldown per chain + NFT collection, shared by every watched wallet.
@@ -1143,6 +1143,9 @@ class Bot:
         saw_real = False
         unsupported = False
         best = None
+        reverted = 0
+        different = 0
+        self.last_pick_reason = ""
         for target, raw, hinted in options:
             data = self.rewrite_watched(raw, acct.address)
             values = []
@@ -1156,16 +1159,23 @@ class Bot:
                     continue
                 saw_real = True
                 if not result:
+                    reverted += 1
                     continue
                 logs, gas_used = result
                 if self.minted_for(logs, acct.address) != want:
+                    different += 1
                     continue
                 if best is None or value < best[0]:
                     best = (value, target, data, max(gas_used, 80_000))
                 break
         if best:
             return best
+        if different:
+            self.last_pick_reason = "the simulated mint did not give the same NFTs as the source wallet got"
+        elif reverted:
+            self.last_pick_reason = "the simulated mint reverted for this minter (price, allowlist, phase or supply)"
         if not saw_real and unsupported:
+            self.last_pick_reason = "your RPC cannot simulate; set a node with eth_simulateV1 or debug_traceCall"
             if self.allow_estimate:
                 return self.fallback(chain_id, acct, options, want)
             log(
@@ -1207,7 +1217,15 @@ class Bot:
                 ),
             )
         if not options:
-            log(f"skip {tx['hash']} no mint call")
+            alert(
+                f"skip {tx['hash']} no mint call",
+                card(
+                    f"⚠️ Not copied · {chain.name}",
+                    ("Why", "could not find a mint call in the source transaction"),
+                    ("Collection (CA)", "\n" + collections_html(want)),
+                    ("Source tx", code(tx["hash"])),
+                ),
+            )
             self.seen.add(key)
             self.pending.pop(key, None)
             self._save()
@@ -1243,7 +1261,17 @@ class Bot:
                     continue
             chosen = self.pick(chain_id, acct, options, want)
             if not chosen:
-                log(f"skip {acct.address[:8]} simulation does not match {qty}")
+                reason = getattr(self, "last_pick_reason", "") or "no working mint call found"
+                alert(
+                    f"skip {acct.address[:8]} not copied on {chain.name}: {reason}",
+                    card(
+                        f"⚠️ Not copied · {chain.name}",
+                        ("Minter", code(acct.address)),
+                        ("Why", esc(reason)),
+                        ("Collection (CA)", "\n" + collections_html(want)),
+                        ("Source tx", code(tx["hash"])),
+                    ),
+                )
                 continue
             value, target, data, gas_used = chosen
             gas = int(gas_used * 1.25) + 20_000
@@ -1447,15 +1475,6 @@ class Bot:
                 log(f"skip {txh}: collection cooldown active for {names}; about {wait}s remaining")
                 self.seen.add(key)
                 self._save()
-                alert(
-                    f"⏭ duplicate collection mint suppressed on {self.chains[chain_id].name}: {names}; cooldown ~{wait}s",
-                    card(
-                        f"⏭ Duplicate mint suppressed · {self.chains[chain_id].name}",
-                        ("Collection (CA)", "\n" + "\n".join(code(item[0].split(":", 1)[1]) for item in blocked)),
-                        ("Cooldown left", f"~{wait}s"),
-                        ("Tx", code(txh)),
-                    ),
-                )
                 return
             try:
                 finished = self.copy(chain_id, tx, want)

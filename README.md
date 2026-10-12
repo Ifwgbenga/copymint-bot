@@ -51,7 +51,7 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `ENABLE_BRIDGE` | `true` |
 | `MAX_MINT_ETH` | `0.05`, the cap in each chain's native coin |
 | `MAX_MINT_<chainId>` | optional per-chain cap, for example `MAX_MINT_56=0.1` for BNB Chain |
-| `MINT_COOLDOWN_SECONDS` | `300` by default; suppresses a second copy trigger for the same collection on the same chain for five minutes. `0` disables it |
+| `MINT_COOLDOWN_SECONDS` | `0` (off) by default. Set a number of seconds to ignore repeat mints of the same collection on the same chain. Leave it off if watched wallets mint several times in a row, because every repeat would be skipped |
 | `WSS_<chainId>` | optional `wss://` endpoint (for example `WSS_8453`) for instant detection; see WebSocket mode |
 | `WSS_BACKUP_SECONDS` | `5` by default; how often polling checks a chain whose socket is live |
 | `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
@@ -132,7 +132,7 @@ No network or keys are needed. The tests cover call decoding, mint detection, fe
 ## Rules
 
 - `WATCH_ADDRESSES` must be other people. Do not put your own minter keys in that list, or a copy could loop.
-- Cross-wallet duplicate suppression is shared across all watched wallets and keyed by chain plus NFT collection. The first eligible mint claims the cooldown and other transactions for that collection are skipped until it expires, including repeat mints by the same wallet. If a copy finishes with no minter minting and is not retrying, the claim is released. Set `MINT_COOLDOWN_SECONDS=0` to disable it. A source transaction touching several collections is suppressed as a whole if any of them is cooling down.
+- Cross-wallet duplicate suppression is shared across all watched wallets and keyed by chain plus NFT collection. The first eligible mint claims the cooldown and other transactions for that collection are skipped until it expires, including repeat mints by the same wallet. If a copy finishes with no minter minting and is not retrying, the claim is released. It is off by default; set `MINT_COOLDOWN_SECONDS` above 0 to turn it on. Suppressed mints are logged, not sent to Telegram. A source transaction touching several collections is suppressed as a whole if any of them is cooling down.
 - `MAX_MINT_ETH` skips a mint whose transaction value is above the cap. The number is in each chain's own coin (ETH, BNB, POL), so use `MAX_MINT_<chainId>` where 0.05 is the wrong size. Raise it if you want to copy paid mints.
 - Minter wallets are hot wallets. Keep only what a few mints need in them, and refill from the funder.
 - A copied mint can still be a token you cannot sell. The simulation proves you receive the NFT, not that it has value.

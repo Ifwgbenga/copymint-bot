@@ -26,6 +26,7 @@ def make_bot(**env):
         "MINTER_PRIVATE_KEYS": TEST_KEY,
         "CHAINS": "1,56",
         "STATE_PATH": os.path.join(tempfile.mkdtemp(), "state.json"),
+        "MINT_COOLDOWN_SECONDS": "300",
     }
     values.update(env)
     with mock.patch.dict(os.environ, values, clear=True):
@@ -40,8 +41,14 @@ def mint_logs(wallet, *collections):
 
 
 class Claiming(unittest.TestCase):
-    def test_default_cooldown_is_five_minutes(self):
-        self.assertEqual(make_bot().mint_cooldown_seconds, 300)
+    def test_cooldown_is_off_unless_asked_for(self):
+        with mock.patch.dict(os.environ, {"WATCH_ADDRESSES": WATCHED, "MINTER_PRIVATE_KEYS": TEST_KEY, "CHAINS": "1"}, clear=True):
+            self.assertEqual(bot.Bot().mint_cooldown_seconds, 0)
+
+    def test_a_wallet_minting_ten_times_is_copied_ten_times_by_default(self):
+        b = make_bot(MINT_COOLDOWN_SECONDS="0")
+        for n in range(10):
+            self.assertTrue(b.claim_collection_cooldown(1, f"0xh{n}", {COLLECTION: 1})[0])
 
     def test_bad_cooldown_setting_stops_the_bot(self):
         for value in ("abc", "1.5"):
@@ -149,7 +156,7 @@ class SharedHandler(unittest.TestCase):
             b.handle_tx(1, "0xh2", mint_logs(OTHER_WATCHED, COLLECTION))
         self.assertEqual(b.copy.call_count, 1)
         self.assertIn("1:0xh2", b.seen)
-        self.assertIn("suppressed", notify.call_args[0][0])
+        notify.assert_not_called()  # suppressed mints are logged, not sent to Telegram
 
     def test_a_copy_that_minted_nothing_does_not_block_the_next_wallet(self):
         b = self.build(copy_result=0)
