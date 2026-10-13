@@ -495,6 +495,8 @@ class Bot:
             raise SystemExit("MINT_COOLDOWN_SECONDS must be a non-negative integer") from exc
         # One cooldown per chain + NFT collection, shared by every watched wallet.
         self.collection_cooldowns = {}
+        # chain:collection -> minter addresses this bot has already minted it from.
+        self.minted_before = {}
         self._collection_lock = threading.Lock()
         self.paused = False
         self.cap_overrides = {}
@@ -534,6 +536,12 @@ class Bot:
                 if until > now and tx_hash:
                     self.collection_cooldowns[str(key)] = {"until": until, "tx": tx_hash}
 
+            self.minted_before = {}
+            for key, addresses in (data.get("minted_before") or {}).items():
+                if isinstance(addresses, list):
+                    clean = [a.lower() for a in addresses if valid_address(str(a))]
+                    if clean:
+                        self.minted_before[str(key)] = clean
             self.paused = bool(data.get("paused", False))
             saved_watch = data.get("watch")
             if isinstance(saved_watch, list) and saved_watch:
@@ -573,6 +581,9 @@ class Bot:
             live = {k: v for k, v in cooldowns.items() if float(v.get("until", 0)) > now}
             if live:
                 state["collection_cooldowns"] = live
+            minted = dict(getattr(self, "minted_before", {}))
+            if minted:
+                state["minted_before"] = minted
             if self.watch_saved:
                 state["watch"] = sorted(self.watch)
             if self.cap_overrides:
@@ -1150,6 +1161,22 @@ class Bot:
             kept.append((target, data, value))
         return kept
 
+    def remember_minted(self, chain_id, minter, want):
+        """Note that this minter has minted these collections, so a later refusal is expected."""
+        who = minter.lower()
+        for collection in want:
+            key = f"{chain_id}:{collection.lower()}"
+            holders = self.minted_before.setdefault(key, [])
+            if who not in holders:
+                holders.append(who)
+        while len(self.minted_before) > 2000:
+            self.minted_before.pop(next(iter(self.minted_before)))
+        self._save()
+
+    def minted_before_any(self, chain_id, minter, want):
+        who = minter.lower()
+        return any(who in self.minted_before.get(f"{chain_id}:{c.lower()}", ()) for c in want)
+
     def explain_no_mint(self, tx):
         """Say why none of the calls in a source transaction could be copied."""
         calls = expand_calls(tx["to"], tx.get("input") or "0x", int(tx.get("value") or "0", 16))
@@ -1200,6 +1227,7 @@ class Bot:
         reverted = 0
         different = 0
         self.last_pick_reason = ""
+        self.last_pick_kind = ""
         for target, raw, hinted in options:
             data = self.rewrite_watched(raw, acct.address)
             values = []
@@ -1225,10 +1253,13 @@ class Bot:
         if best:
             return best
         if different:
+            self.last_pick_kind = "different"
             self.last_pick_reason = "the simulated mint did not give the same NFTs as the source wallet got"
         elif reverted:
+            self.last_pick_kind = "reverted"
             self.last_pick_reason = "the simulated mint reverted for this minter (price, allowlist, phase or supply)"
         if not saw_real and unsupported:
+            self.last_pick_kind = "unsupported"
             self.last_pick_reason = "your RPC cannot simulate; set a node with eth_simulateV1 or debug_traceCall"
             if self.allow_estimate:
                 return self.fallback(chain_id, acct, options, want)
@@ -1303,6 +1334,7 @@ class Bot:
                 inflight.pop(who, None)
                 if hit[1]:
                     done.add(who)
+                    self.remember_minted(chain_id, acct.address, want)
                     alert(
                         f"✅ OK {acct.address} {hit[0]}",
                         card(
@@ -1314,6 +1346,11 @@ class Bot:
                     )
                     continue
             chosen = self.pick(chain_id, acct, options, want)
+            if not chosen and getattr(self, "last_pick_kind", "") == "reverted" and self.minted_before_any(chain_id, acct.address, want):
+                # The contract refuses a minter that already minted this collection, most likely a per-wallet limit.
+                log(f"skip {acct.address[:8]} already minted this collection and the contract now refuses, likely at its limit")
+                done.add(who)
+                continue
             if not chosen:
                 reason = getattr(self, "last_pick_reason", "") or "no working mint call found"
                 alert(
@@ -1350,6 +1387,8 @@ class Bot:
                 continue
             if ok:
                 done.add(who)
+                if not self.dry:
+                    self.remember_minted(chain_id, acct.address, want)
                 if self.dry:
                     alert(
                         f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast",
