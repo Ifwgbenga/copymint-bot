@@ -32,7 +32,12 @@ TRANSFER_BATCH = "0x" + keccak(text="TransferBatch(address,address,address,uint2
 ZERO_TOPIC = "0x" + "0" * 64
 LIFI = "https://li.quest/v1/quote"
 MAX_ATTEMPTS = 3
-LOG_CHUNK = 20
+# Blocks per eth_getLogs request. Alchemy's free plan rejects ranges above 10, so 10 is the safe default.
+# Raise LOGS_MAX_BLOCKS on a plan that allows larger ranges.
+try:
+    LOG_CHUNK = max(1, int(os.environ.get("LOGS_MAX_BLOCKS", "10") or 10))
+except ValueError:
+    LOG_CHUNK = 10
 MAX_WATCH = 50
 # The largest cap /cap will set from Telegram, in native coin. Raise MAX_MINT_ETH in the environment for more.
 CAP_COMMAND_LIMIT = Decimal("1")
@@ -505,7 +510,12 @@ class Bot:
         self._watch_lock = threading.RLock()
         # WebSocket mode. A chain with WSS_<chainId> set is pushed new mints and is polled
         # only every WSS_BACKUP_SECONDS as a safety net, or at full speed while its socket is down.
-        self.wss_backup = float(env("WSS_BACKUP_SECONDS", "5"))
+        self.wss_backup = float(env("WSS_BACKUP_SECONDS", "30"))
+        # While a socket is live the backup tick only moves the scan position forward (one cheap request).
+        # Set WSS_BACKUP_SCAN=true to also re-scan the blocks for logs, which costs far more on a fast chain.
+        self.wss_backup_scan = flag("WSS_BACKUP_SCAN")
+        # Chains whose socket just connected or dropped; they get one full catch-up scan.
+        self.ws_gap = set()
         self.ws_live = {}
         self.last_poll = {}
         self.watch_version = 0
@@ -1597,6 +1607,28 @@ class Bot:
             due.append(cid)
         return due
 
+    def advance_head(self, chain_id):
+        """Move the scan position to the latest block without reading logs. The socket covers these blocks."""
+        head = int(self.rpc.call(chain_id, "eth_blockNumber", []), 16)
+        last = self.heads.get(chain_id)
+        if last is None or head > last:
+            self.heads[chain_id] = head
+            self._save()
+
+    def poll_chain(self, chain_id):
+        """One polling round for a chain. With a healthy socket this is a single cheap request."""
+        if self.ws_live.get(chain_id) and chain_id not in self.ws_gap and not self.wss_backup_scan:
+            self.advance_head(chain_id)
+            return
+        gap = chain_id in self.ws_gap
+        self.ws_gap.discard(chain_id)
+        try:
+            self.scan(chain_id)
+        except Exception:
+            if gap:
+                self.ws_gap.add(chain_id)
+            raise
+
     def ws_message(self, chain_id, raw):
         """Handle one websocket frame. Only the first log of each transaction starts any work."""
         try:
@@ -1628,7 +1660,8 @@ class Bot:
                     break
                 time.sleep(0.2)
             if not receipt:
-                log(f"{self.chains[chain_id].name} no receipt yet for {txh}, the poll will catch it")
+                log(f"{self.chains[chain_id].name} no receipt yet for {txh}, the next poll will catch it")
+                self.ws_gap.add(chain_id)  # the next poll does a full scan instead of the cheap tick
                 return
             if as_int(receipt.get("status", "0x1")) != 1:
                 return
@@ -1673,6 +1706,7 @@ class Bot:
                 ws = websocket.create_connection(chain.wss, timeout=10)
                 ws.settimeout(5)
                 self.ws_subscribe(ws, chain_id)
+                self.ws_gap.add(chain_id)
                 self.ws_live[chain_id] = True
                 failures = 0
                 delay = 1
@@ -1703,6 +1737,7 @@ class Bot:
                     notify(f"{chain.name} websocket keeps failing. The bot is polling that chain instead.")
             finally:
                 self.ws_live[chain_id] = False
+                self.ws_gap.add(chain_id)
                 if ws is not None:
                     try:
                         ws.close()
@@ -1772,13 +1807,13 @@ class Bot:
             log("telegram controls enabled")
         streaming = [cid for cid, chain in self.chains.items() if chain.wss]
         if streaming:
-            log(f"websocket mode on for {', '.join(self.chains[cid].name for cid in streaming)}; backup poll every {self.wss_backup:g}s")
+            log(f"websocket mode on for {', '.join(self.chains[cid].name for cid in streaming)}; backup tick every {self.wss_backup:g}s")
             for cid in streaming:
                 threading.Thread(target=self.ws_loop, args=(cid,), daemon=True).start()
         while True:
             for cid in self.chains_due(time.time()):
                 try:
-                    self.scan(cid)
+                    self.poll_chain(cid)
                 except Exception as exc:
                     log(f"{self.chains[cid].name} {exc}")
             try:

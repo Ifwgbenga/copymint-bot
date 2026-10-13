@@ -53,7 +53,9 @@ Do not commit a `.env` file. Keys belong in Railway variables only.
 | `MAX_MINT_<chainId>` | optional per-chain cap, for example `MAX_MINT_56=0.1` for BNB Chain |
 | `MINT_COOLDOWN_SECONDS` | `0` (off) by default. Set a number of seconds to ignore repeat mints of the same collection on the same chain. Leave it off if watched wallets mint several times in a row, because every repeat would be skipped |
 | `WSS_<chainId>` | optional `wss://` endpoint (for example `WSS_8453`) for instant detection; see WebSocket mode |
-| `WSS_BACKUP_SECONDS` | `5` by default; how often polling checks a chain whose socket is live |
+| `WSS_BACKUP_SECONDS` | `30` by default; how often the bot checks the latest block number on a chain whose socket is live. It is one cheap request, and a missed stretch is scanned once if the socket drops |
+| `WSS_BACKUP_SCAN` | `false` by default; set `true` to also re-scan blocks for mint logs on that tick, which costs far more on a fast chain |
+| `LOGS_MAX_BLOCKS` | `10` by default, the most Alchemy's free plan allows per `eth_getLogs` request; raise it on a plan that allows more |
 | `TELEGRAM_BOT_TOKEN` | optional, from @BotFather |
 | `TELEGRAM_CHAT_ID` | optional, the chat that receives alerts |
 | `ALLOW_ESTIMATE_FALLBACK` | `false` by default, see Simulation below |
@@ -115,7 +117,7 @@ To get a chat id, message your bot once, then open `https://api.telegram.org/bot
 
 ## WebSocket mode
 
-Set `WSS_<chainId>` to your provider's `wss://` URL (Alchemy gives one per chain) and the bot subscribes to mint logs for your watched wallets instead of waiting for the next poll. It reads each transaction's receipt, so a mint of 10 is copied as 10. Polling keeps running as a slow backup (`WSS_BACKUP_SECONDS`) while a socket is live and returns to full speed if the socket drops. A transaction seen by both is copied once. The bot reconnects with backoff, resubscribes when you change the watch list, and sends one Telegram alert after five failed connects in a row. Look for `<chain> websocket live` in the logs, or `websocket live:` in `/status`. Chains without a `WSS_` variable just poll.
+Set `WSS_<chainId>` to your provider's `wss://` URL (Alchemy gives one per chain) and the bot subscribes to mint logs for your watched wallets instead of waiting for the next poll. It reads each transaction's receipt, so a mint of 10 is copied as 10. While a socket is live the bot only checks the latest block number now and then (`WSS_BACKUP_SECONDS`). If the socket drops or reconnects, it scans the missed blocks once and polls at full speed until the socket is back. A transaction seen by both is copied once. The bot reconnects with backoff, resubscribes when you change the watch list, and sends one Telegram alert after five failed connects in a row. Look for `<chain> websocket live` in the logs, or `websocket live:` in `/status`. Chains without a `WSS_` variable just poll.
 
 ## Simulation
 

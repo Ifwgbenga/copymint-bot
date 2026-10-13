@@ -145,6 +145,7 @@ class Receipts(unittest.TestCase):
         with mock.patch.object(bot.time, "sleep", lambda s: None):
             b.process_ws_tx(1, "0xh1")
         b.copy.assert_not_called()
+        self.assertIn(1, b.ws_gap)  # so the next poll scans for it
 
     def test_the_poll_and_the_websocket_copy_a_mint_once(self):
         logs = [{"address": COLLECTION, "topics": [bot.TRANSFER, bot.ZERO_TOPIC, topic(WATCHED), "0x" + "0" * 64]}]
