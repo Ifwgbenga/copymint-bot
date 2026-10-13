@@ -1406,17 +1406,7 @@ class Bot:
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:
-            via = tx["to"] if tx["to"].lower() not in {c.lower() for c in want} else None
-            alert(
-                f"🎯 mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}",
-                card(
-                    f"🎯 Mint detected · {chain.name}",
-                    ("Wallet", code(tx["from"])),
-                    ("Collection (CA)", "\n" + collections_html(want)),
-                    ("Called", code(via) if via else None),
-                    ("Tx", code(tx["hash"])),
-                ),
-            )
+            log(f"🎯 mint by {tx['from']} on {chain.name} -> {tx['to']} {qty} {tx['hash']}")
         if not options:
             self.send_summary(chain_id, tx, want, item, note="could not copy: " + self.explain_no_mint(tx))
             self.seen.add(key)

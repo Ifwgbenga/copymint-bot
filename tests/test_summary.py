@@ -102,12 +102,12 @@ class Summary(unittest.TestCase):
         self.assertIn("2 minter(s): reason one", text)
         self.assertNotIn("Total cost", text)
 
-    def test_it_is_one_message_after_the_detected_alert(self):
+    def test_there_is_no_detected_alert_only_the_summary(self):
         b = make_bot()
         rpc(b)
         messages = run_copy(b, [True, True])
-        self.assertEqual(len(messages), 2)
-        self.assertIn("Mint detected", messages[0])
+        self.assertEqual(len(messages), 1)
+        self.assertNotIn("Mint detected", messages[0])
 
     def test_when_every_minter_already_minted_nothing_is_sent_after_detection(self):
         b = make_bot()
@@ -115,8 +115,7 @@ class Summary(unittest.TestCase):
         for m in b.minters:
             b.minted_before[f"1:{COLLECTION}"] = b.minted_before.get(f"1:{COLLECTION}", []) + [m.address.lower()]
         messages = run_copy(b, ["reverted", "reverted"])
-        self.assertEqual(len(messages), 1)
-        self.assertIn("Mint detected", messages[0])
+        self.assertEqual(messages, [])
 
     def test_dry_run_summary(self):
         b = make_bot()
