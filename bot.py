@@ -172,6 +172,31 @@ def card(title, *rows):
     return "\n".join(lines)
 
 
+NATIVE_SYMBOL = {56: "BNB", 137: "POL", 999: "HYPE"}
+
+
+def native_symbol(chain_id):
+    return NATIVE_SYMBOL.get(chain_id, "ETH")
+
+
+def fmt_native(wei, chain_id):
+    amount = Decimal(int(wei)) / Decimal(10**18)
+    text = f"{amount:.4f}" if amount >= Decimal("0.0001") or amount == 0 else f"{amount:.6f}"
+    return f"{text} {native_symbol(chain_id)}"
+
+
+def decode_abi_string(raw):
+    """Decode the return value of a function that returns one string. Returns '' if it is not one."""
+    try:
+        data = bytes.fromhex((raw or "0x")[2:])
+        offset = int.from_bytes(data[0:32], "big")
+        length = int.from_bytes(data[offset : offset + 32], "big")
+        text = data[offset + 32 : offset + 32 + length].decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    return "".join(ch for ch in text if ch.isprintable()).strip()[:40]
+
+
 def collections_html(want):
     """One line per collection: the full contract address and how many were minted."""
     return "\n".join(f"{code(collection)} ×{amount}" for collection, amount in want.items())
@@ -502,6 +527,7 @@ class Bot:
         self.collection_cooldowns = {}
         # chain:collection -> minter addresses this bot has already minted it from.
         self.minted_before = {}
+        self._names = {}
         self._collection_lock = threading.Lock()
         self.paused = False
         self.cap_overrides = {}
@@ -1171,6 +1197,86 @@ class Bot:
             kept.append((target, data, value))
         return kept
 
+    def collection_name(self, chain_id, collection):
+        """The collection's name() if it has one, cached so each contract is asked once."""
+        key = f"{chain_id}:{collection.lower()}"
+        if key not in self._names:
+            name = ""
+            try:
+                raw = self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(collection), "data": "0x06fdde03"}, "latest"])
+                name = decode_abi_string(raw)
+            except Exception:
+                pass
+            self._names[key] = name
+        return self._names[key]
+
+    def mint_cost(self, chain_id, txh, value):
+        """Mint price plus gas for one landed transaction, in wei, or None if the receipt can't be read."""
+        try:
+            receipt = self.rpc.call(chain_id, "eth_getTransactionReceipt", [txh])
+            if not receipt:
+                return None
+            price = as_int(receipt.get("effectiveGasPrice") or receipt.get("gasPrice"))
+            return as_int(receipt.get("gasUsed")) * price + int(value or 0)
+        except Exception:
+            return None
+
+    def send_summary(self, chain_id, tx, want, item, gave_up=False, note=""):
+        """One Telegram message for a finished mint: who copied, who didn't, why, and what it cost."""
+        chain = self.chains[chain_id]
+        report = item.get("report") or {}
+        total = len(self.minters)
+        minted = [r for r in report.values() if r.get("status") == "minted"]
+        dry = [r for r in report.values() if r.get("status") == "dry"]
+        quiet = [r for r in report.values() if r.get("status") == "quiet"]
+        problems = [r for r in report.values() if r.get("status") in ("failed", "retrying")]
+        if not minted and not dry and not problems and not note and not gave_up:
+            log(f"{chain.name} {tx['hash']}: nothing to report, every minter had already minted this collection")
+            return
+        per_minter = sum(want.values())
+        if minted and len(minted) == total:
+            title, mood = "✅ Copied", "ok"
+        elif minted:
+            title, mood = "⚠️ Partially copied", "partial"
+        elif dry:
+            title, mood = "🧪 Dry run", "dry"
+        elif gave_up:
+            title, mood = "🛑 Gave up", "bad"
+        else:
+            title, mood = "❌ Not copied", "bad"
+        names = [self.collection_name(chain_id, c) for c in want]
+        if len(want) == 1:
+            collection_rows = [
+                ("Collection", esc(names[0]) if names[0] else None),
+                ("CA", code(next(iter(want))) + f" ×{per_minter}"),
+            ]
+        else:
+            lines = []
+            for (collection, amount), name in zip(want.items(), names):
+                lines.append((esc(name) + "\n" if name else "") + f"{code(collection)} ×{amount}")
+            collection_rows = [("Collections", "\n" + "\n".join(lines))]
+        reasons = {}
+        for record in problems:
+            reasons[record.get("reason") or "did not land"] = reasons.get(record.get("reason") or "did not land", 0) + 1
+        skipped_text = "\n".join(f"• {count} minter(s): {esc(reason)}" for reason, count in reasons.items())
+        costs = [self.mint_cost(chain_id, r["txh"], r.get("value")) for r in minted if r.get("txh")]
+        costs = [c for c in costs if c is not None]
+        done_count = len(minted) or len(dry)
+        rows = collection_rows + [
+            ("Minted" if minted else None, f"{per_minter * len(minted)} NFTs across {len(minted)} minter(s)" if minted else None),
+            ("Would mint" if dry and not minted else None, f"{per_minter * len(dry)} NFTs across {len(dry)} minter(s)" if dry and not minted else None),
+            ("Minters copied", f"{done_count} of {total}"),
+            ("Skipped", ("\n" + skipped_text) if skipped_text else None),
+            ("Already minted", f"{len(quiet)} minter(s), limit reached" if quiet and (minted or problems) else None),
+            ("Note", esc(note) if note else None),
+            ("Total cost", fmt_native(sum(costs), chain_id) if costs else None),
+            ("Source wallet", code(tx["from"])),
+            ("Source tx", code(tx["hash"])),
+        ]
+        rows = [(label, value) for label, value in rows if label]
+        plain = f"{title} on {chain.name}: {done_count} of {total} minters, source {tx['hash']}"
+        alert(plain, card(f"{title} · {chain.name}", *rows))
+
     def remember_minted(self, chain_id, minter, want):
         """Note that this minter has minted these collections, so a later refusal is expected."""
         who = minter.lower()
@@ -1312,15 +1418,7 @@ class Bot:
                 ),
             )
         if not options:
-            alert(
-                f"skip {tx['hash']} no mint call",
-                card(
-                    f"⚠️ Not copied · {chain.name}",
-                    ("Why", esc("could not copy: " + self.explain_no_mint(tx))),
-                    ("Collection (CA)", "\n" + collections_html(want)),
-                    ("Source tx", code(tx["hash"])),
-                ),
-            )
+            self.send_summary(chain_id, tx, want, item, note="could not copy: " + self.explain_no_mint(tx))
             self.seen.add(key)
             self.pending.pop(key, None)
             self._save()
@@ -1329,6 +1427,7 @@ class Bot:
         temporary = False
         done = set(a.lower() for a in item.get("done") or [])
         inflight = item.get("inflight") or {}
+        report = item.setdefault("report", {})
         for acct in self.minters:
             who = acct.address.lower()
             if who in done:
@@ -1345,54 +1444,34 @@ class Bot:
                 if hit[1]:
                     done.add(who)
                     self.remember_minted(chain_id, acct.address, want)
-                    alert(
-                        f"✅ OK {acct.address} {hit[0]}",
-                        card(
-                            f"✅ Copied · {chain.name}",
-                            ("Minter", code(acct.address)),
-                            ("Collection (CA)", "\n" + collections_html(want)),
-                            ("Tx", code(hit[0])),
-                        ),
-                    )
+                    report[who] = {"status": "minted", "txh": hit[0], "value": (report.get(who) or {}).get("value", 0)}
+                    log(f"✅ OK {acct.address} {hit[0]}")
                     continue
             chosen = self.pick(chain_id, acct, options, want)
             if not chosen and getattr(self, "last_pick_kind", "") == "reverted" and self.minted_before_any(chain_id, acct.address, want):
                 # The contract refuses a minter that already minted this collection, most likely a per-wallet limit.
                 log(f"skip {acct.address[:8]} already minted this collection and the contract now refuses, likely at its limit")
                 done.add(who)
+                report[who] = {"status": "quiet"}
                 continue
             if not chosen:
                 reason = getattr(self, "last_pick_reason", "") or "no working mint call found"
-                alert(
-                    f"skip {acct.address[:8]} not copied on {chain.name}: {reason}",
-                    card(
-                        f"⚠️ Not copied · {chain.name}",
-                        ("Minter", code(acct.address)),
-                        ("Why", esc(reason)),
-                        ("Collection (CA)", "\n" + collections_html(want)),
-                        ("Source tx", code(tx["hash"])),
-                    ),
-                )
+                log(f"skip {acct.address[:8]} not copied on {chain.name}: {reason}")
+                report[who] = {"status": "failed", "reason": reason}
                 continue
             value, target, data, gas_used = chosen
             gas = int(gas_used * 1.25) + 20_000
             fee, _tip = self.fees(chain_id)
             if not self.ensure(acct, chain_id, value + gas * fee):
-                alert(
-                    f"💸 skip {acct.address[:8]} not enough on {chain.name} and no route",
-                    card(
-                        f"💸 Skipped · {chain.name}",
-                        ("Minter", code(acct.address)),
-                        ("Why", "not enough funds and no bridge route"),
-                        ("Collection (CA)", "\n" + collections_html(want)),
-                    ),
-                )
+                log(f"💸 skip {acct.address[:8]} not enough on {chain.name} and no route")
+                report[who] = {"status": "retrying", "reason": "not enough funds and no bridge route"}
                 temporary = True
                 continue
             try:
                 txh, ok, sent = self.land(chain_id, acct, target, data, value, gas)
             except Exception as exc:
                 log(f"send {acct.address[:8]} {exc}")
+                report[who] = {"status": "retrying", "reason": "sending the mint failed"}
                 temporary = True
                 continue
             if ok:
@@ -1400,44 +1479,24 @@ class Bot:
                 if not self.dry:
                     self.remember_minted(chain_id, acct.address, want)
                 if self.dry:
-                    alert(
-                        f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast",
-                        card(
-                            f"🧪 Dry run · {chain.name}",
-                            ("Minter", code(acct.address)),
-                            ("Collection (CA)", "\n" + collections_html(want)),
-                            ("Result", "would mint, not broadcast"),
-                        ),
-                    )
+                    log(f"🧪 DRY {acct.address} would mint on {chain.name}, not broadcast")
+                    report[who] = {"status": "dry"}
                 else:
-                    alert(
-                        f"✅ OK {acct.address} {txh}",
-                        card(
-                            f"✅ Copied · {chain.name}",
-                            ("Minter", code(acct.address)),
-                            ("Collection (CA)", "\n" + collections_html(want)),
-                            ("Tx", code(txh)),
-                        ),
-                    )
+                    log(f"✅ OK {acct.address} {txh}")
+                    report[who] = {"status": "minted", "txh": txh, "value": value}
             else:
                 inflight[who] = sent
+                report[who] = {"status": "retrying", "reason": "did not land in time", "value": value}
                 temporary = True
                 log(f"pending {acct.address} {txh}")
         item["done"] = sorted(done)
         item["inflight"] = inflight
         if len(done) == len(self.minters) or not temporary:
+            self.send_summary(chain_id, tx, want, item)
             self.seen.add(key)
             self.pending.pop(key, None)
         elif item["attempts"] >= MAX_ATTEMPTS:
-            alert(
-                f"🛑 giving up {tx['hash']} after {item['attempts']} attempts",
-                card(
-                    f"🛑 Gave up · {chain.name}",
-                    ("Attempts", item["attempts"]),
-                    ("Collection (CA)", "\n" + collections_html(want)),
-                    ("Source tx", code(tx["hash"])),
-                ),
-            )
+            self.send_summary(chain_id, tx, want, item, gave_up=True, note=f"gave up after {item['attempts']} attempts")
             self.seen.add(key)
             self.pending.pop(key, None)
         else:

@@ -88,6 +88,8 @@ OK 0x0381... 0xhash
 
 Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and the bot messages you when it starts, when a watched wallet mints, when a copy lands, and when a copy is given up on, skipped for lack of funds, or a bridge times out. Leave them unset and the bot logs only. Alerts are sent in the background, so a slow Telegram never delays a mint.
 
+After a mint is copied, the bot sends one summary message: the collection name and contract address, how many NFTs were minted, how many of your minters copied, why any were skipped, and the total cost (mint price plus gas). A minter that already minted the collection and is now refused is left out quietly. If a minter has to retry, the summary arrives when it succeeds or the bot gives up.
+
 ## Telegram controls
 
 With the same two variables set, type `/` in the chat with the bot. Telegram shows the command menu, so you do not have to type the names. The menu is registered when the bot starts. Redeploy after pulling this version, then open the chat and type `/`.
