@@ -304,6 +304,11 @@ def expand_calls(target, data, value, depth=0):
     return [(target, data, value)]
 
 
+# Simulations run as if the minter could pay, so a low balance never makes a mint look like it reverts.
+# The bot bridges or swaps in the missing funds after the simulation passes.
+SIM_BALANCE = hex(10**24)
+
+
 def looks_signed(data):
     if len(data) < 10:
         return False
@@ -1066,7 +1071,16 @@ class Bot:
             result = self.rpc.call(
                 chain_id,
                 "eth_simulateV1",
-                [{"blockStateCalls": [{"calls": [call]}], "validation": False, "traceTransfers": True}, "latest"],
+                [
+                    {
+                        "blockStateCalls": [
+                            {"stateOverrides": {call["from"]: {"balance": SIM_BALANCE}}, "calls": [call]}
+                        ],
+                        "validation": False,
+                        "traceTransfers": True,
+                    },
+                    "latest",
+                ],
             )
             status = 1
             gas_used = 0
@@ -1095,7 +1109,15 @@ class Bot:
             result = self.rpc.call(
                 chain_id,
                 "debug_traceCall",
-                [call, "latest", {"tracer": "callTracer", "tracerConfig": {"withLog": True}}],
+                [
+                    call,
+                    "latest",
+                    {
+                        "tracer": "callTracer",
+                        "tracerConfig": {"withLog": True},
+                        "stateOverrides": {call["from"]: {"balance": SIM_BALANCE}},
+                    },
+                ],
             )
         except Exception as exc:
             if method_missing(exc):
@@ -1112,16 +1134,39 @@ class Bot:
             return "unsupported"
         return logs, gas_used or 400_000
 
-    def candidates(self, tx):
+    def candidates(self, tx, want=None):
         calls = expand_calls(tx["to"], tx.get("input") or "0x", int(tx.get("value") or "0", 16))
+        collections = {c.lower() for c in (want or {})}
         kept = []
         for target, data, value in calls:
             if len(data) < 10:
+                # A plain ETH send to the NFT contract can be the mint (a receive() or fallback mint).
+                # Simulation still has to show the same NFTs before anything is sent.
+                if value > 0 and target.lower() in collections:
+                    kept.append((target, "0x", value))
                 continue
             if data[:10].lower() in NON_MINT or looks_signed(data):
                 continue
             kept.append((target, data, value))
         return kept
+
+    def explain_no_mint(self, tx):
+        """Say why none of the calls in a source transaction could be copied."""
+        calls = expand_calls(tx["to"], tx.get("input") or "0x", int(tx.get("value") or "0", 16))
+        if not calls:
+            return "the transaction has no calls"
+        parts = []
+        for target, data, value in calls[:3]:
+            where = f"to {short_address(target)}"
+            if len(data) < 10:
+                parts.append(f"plain ETH send with no call data {where}")
+            elif looks_signed(data):
+                parts.append(f"signed or allowlist mint (call {data[:10]}) {where}; the signature only works for the source wallet")
+            elif data[:10].lower() in NON_MINT:
+                parts.append(f"not a mint (call {data[:10]}) {where}")
+            else:
+                parts.append(f"call {data[:10]} {where}")
+        return "; ".join(parts)
 
     def fallback(self, chain_id, acct, options, want):
         simple = []
@@ -1210,7 +1255,7 @@ class Bot:
             "done": [],
             "inflight": {},
         }
-        options = self.candidates(tx)
+        options = self.candidates(tx, want)
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:
@@ -1230,7 +1275,7 @@ class Bot:
                 f"skip {tx['hash']} no mint call",
                 card(
                     f"⚠️ Not copied · {chain.name}",
-                    ("Why", "could not find a mint call in the source transaction"),
+                    ("Why", esc("could not copy: " + self.explain_no_mint(tx))),
                     ("Collection (CA)", "\n" + collections_html(want)),
                     ("Source tx", code(tx["hash"])),
                 ),
