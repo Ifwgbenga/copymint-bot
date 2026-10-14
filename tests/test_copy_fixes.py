@@ -64,6 +64,11 @@ class Explanations(unittest.TestCase):
         data = bot.selector("approve(address,uint256)") + "0" * 128
         self.assertIn("not a mint", make_bot().explain_no_mint(tx(data=data)))
 
+    def test_seadrop_signed_mint_is_named(self):
+        text = make_bot().explain_no_mint(tx(data="0x4b61cd6f" + "0" * 64))
+        self.assertIn("SeaDrop signed mint", text)
+        self.assertEqual(bot.SEADROP_MINT_SIGNED, "0x4b61cd6f")
+
     def test_unknown_call_shows_its_function_id(self):
         self.assertIn("0xdeadbeef", make_bot().explain_no_mint(tx(data="0xdeadbeef" + "0" * 64)))
 

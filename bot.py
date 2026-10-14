@@ -57,6 +57,9 @@ MINT_OK = {
     selector("claim(address,uint256)"),
     selector("purchase(uint256)"),
 }
+SEADROP_MINT_SIGNED = selector(
+    "mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)"
+)
 NON_MINT = {
     selector("approve(address,uint256)"),
     selector("transfer(address,uint256)"),
@@ -1303,8 +1306,13 @@ class Bot:
             where = f"to {short_address(target)}"
             if len(data) < 10:
                 parts.append(f"plain ETH send with no call data {where}")
+            elif data[:10].lower() == SEADROP_MINT_SIGNED:
+                parts.append(
+                    f"OpenSea SeaDrop signed mint {where}: the project's server signs it for one wallet, "
+                    "so it cannot be repeated from another wallet"
+                )
             elif looks_signed(data):
-                parts.append(f"signed or allowlist mint (call {data[:10]}) {where}; the signature only works for the source wallet")
+                parts.append(f"signed or allowlist mint (call {data[:10]}) {where}; the signature or proof only works for the source wallet")
             elif data[:10].lower() in NON_MINT:
                 parts.append(f"not a mint (call {data[:10]}) {where}")
             else:
