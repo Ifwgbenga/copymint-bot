@@ -60,6 +60,19 @@ MINT_OK = {
 SEADROP_MINT_SIGNED = selector(
     "mintSigned(address,address,address,uint256,(uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool),uint256,bytes)"
 )
+# Mint functions the /mint command tries. "q" is the quantity and "a" is the minter's own address.
+MANUAL_CALLS = (
+    ("mint(uint256)", "q"),
+    ("mint(address,uint256)", "aq"),
+    ("mint(uint256,address)", "qa"),
+    ("publicMint(uint256)", "q"),
+    ("purchase(uint256)", "q"),
+    ("claim(uint256)", "q"),
+    ("claim(address,uint256)", "aq"),
+    ("mint()", ""),
+)
+PRICE_VIEWS = ("mintPrice()", "price()", "cost()", "publicPrice()", "PRICE()", "salePrice()", "MINT_PRICE()")
+MAX_MANUAL_QTY = 200
 NON_MINT = {
     selector("approve(address,uint256)"),
     selector("transfer(address,uint256)"),
@@ -215,6 +228,7 @@ MENU = (
     ("minters", "👛 Minter and funder addresses"),
     ("balance", "💰 Native balance on each chain"),
     ("cap", "🎯 Show or set the mint cap"),
+    ("mint", "🎟 Mint a contract with all minters"),
     ("help", "ℹ️ List every command"),
 )
 
@@ -711,6 +725,97 @@ class Bot:
             self._save()
         return "\n".join(lines)
 
+    def manual_options(self, chain_id, contract, qty, price_wei=None):
+        """The calls /mint will try. Each minter simulates them and uses the first that gives it the NFTs."""
+        cap = self.cap(chain_id)
+        value = 0
+        if price_wei is not None:
+            value = price_wei * qty
+        else:
+            for signature in PRICE_VIEWS:
+                try:
+                    raw = self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(contract), "data": selector(signature)}, "latest"])
+                    unit = as_int(raw)
+                except Exception:
+                    continue
+                if 0 < unit * qty <= cap:
+                    value = unit * qty
+                    break
+        with self._watch_lock:
+            placeholder = sorted(self.watch)[0]  # swapped for each minter's own address when it simulates
+        options = []
+        for signature, layout in MANUAL_CALLS:
+            if signature == "mint()" and qty != 1:
+                continue
+            words = "".join(
+                f"{qty:064x}" if kind == "q" else "0" * 24 + placeholder[2:] for kind in layout
+            )
+            options.append((contract, selector(signature) + words, value))
+        if value > 0:
+            options.append((contract, "0x", value))
+        return options
+
+    def mint_command(self, args):
+        args = list(args)
+        usage = "✏️ Usage: /mint [CHAIN_ID] 0xCONTRACT [QUANTITY] [PRICE_PER_NFT]\nExample: /mint 4663 0xabc… 2 0.001"
+        if not args:
+            return usage
+        chain_id = None
+        if args[0].isdigit():
+            chain_id = int(args.pop(0))
+            if chain_id not in self.chains:
+                return f"⚠️ Chain {chain_id} is not enabled."
+        elif len(self.chains) == 1:
+            chain_id = next(iter(self.chains))
+        else:
+            return "⚠️ Start with the chain ID, for example /mint 4663 0xabc… 1"
+        contract = valid_address(args[0]) if args else None
+        if contract is None:
+            return "⚠️ That is not a valid contract address.\n" + usage
+        try:
+            qty = int(args[1]) if len(args) > 1 else 1
+        except ValueError:
+            return "⚠️ Quantity must be a whole number.\n" + usage
+        if not 1 <= qty <= MAX_MANUAL_QTY:
+            return f"⚠️ Quantity must be between 1 and {MAX_MANUAL_QTY}."
+        price_wei = None
+        if len(args) > 2:
+            try:
+                price = Decimal(args[2])
+            except Exception:
+                return "⚠️ Price must be a number, in the chain's coin per NFT."
+            if not price.is_finite() or price < 0:
+                return "⚠️ Price must be zero or more."
+            price_wei = to_wei(price)
+        try:
+            code_at = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"])
+        except Exception:
+            return "⚠️ Could not reach the chain's RPC. Try again."
+        if not code_at or code_at in ("0x", "0x0"):
+            return "⚠️ There is no contract at that address on this chain."
+        threading.Thread(target=self.run_manual_mint, args=(chain_id, contract, qty, price_wei), daemon=True).start()
+        mode = " (dry run, nothing will be sent)" if self.dry else ""
+        return (
+            f"🎟 Minting {qty} from {contract} on {self.chains[chain_id].name} with {len(self.minters)} minter(s){mode}.\n"
+            "A summary follows when it is done."
+        )
+
+    def run_manual_mint(self, chain_id, contract, qty, price_wei):
+        try:
+            options = self.manual_options(chain_id, contract, qty, price_wei)
+            tx = {
+                "hash": f"manual-{int(time.time())}-{contract[2:8]}",
+                "from": "manual",
+                "to": contract,
+                "value": "0x0",
+                "input": "0x",
+            }
+            with self._copy_lock:
+                self.copy(chain_id, tx, {contract: qty}, options=options)
+        except Exception as exc:
+            log(f"/mint {contract} {type(exc).__name__}: {exc}")
+            notify(f"⚠️ /mint failed: {type(exc).__name__}")
+
     def cap_command(self, args):
         if not args:
             rows = [f"• {chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
@@ -790,6 +895,8 @@ class Bot:
             return self.balances_text()
         if command == "/cap":
             return self.cap_command(args)
+        if command == "/mint":
+            return self.mint_command(args)
         if command in ("/help", "/start"):
             lines = ["Tap / to open the menu.\n"]
             lines.extend(f"/{name}  {text}" for name, text in MENU)
@@ -1394,7 +1501,7 @@ class Bot:
             )
         return None
 
-    def copy(self, chain_id, tx, want):
+    def copy(self, chain_id, tx, want, options=None):
         key = f"{chain_id}:{tx['hash']}"
         if key in self.seen:
             return
@@ -1410,7 +1517,13 @@ class Bot:
             "done": [],
             "inflight": {},
         }
-        options = self.candidates(tx, want)
+        if options is not None and not item.get("options"):
+            item["options"] = [list(option) for option in options]
+        if item.get("options"):
+            # A /mint command saves the calls it built, so retries use the same ones.
+            options = [tuple(option) for option in item["options"]]
+        else:
+            options = self.candidates(tx, want)
         chain = self.chains[chain_id]
         qty = ", ".join(f"{collection[:8]} x{amount}" for collection, amount in want.items())
         if item["attempts"] == 0:

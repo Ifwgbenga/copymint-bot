@@ -105,8 +105,10 @@ With the same two variables set, type `/` in the chat with the bot. Telegram sho
 | `/minters` | Shows your minter and funder addresses, never their keys |
 | `/balance` | Shows each minter's native balance on every chain |
 | `/cap` | Shows the mint value cap per chain. `/cap 56 0.1` sets one chain and `/cap all 0.05` sets all |
+| `/mint [CHAIN_ID] 0xCONTRACT [QTY] [PRICE]` | Mints a public-mint contract with every minter, without a watched wallet. The chain ID is only needed with several chains. Quantity defaults to 1. The price per NFT is read from the contract if you leave it out. Example: `/mint 4663 0xabc… 2 0.001` |
 | `/help` | Lists the commands |
 
+- `/mint` tries the common mint calls (`mint`, `publicMint`, `purchase`, `claim`, and a plain ETH send) and checks each with a simulation per minter, so a minter only sends if the simulation shows it receiving the NFTs. It respects the mint cap and dry run. It cannot do allowlist, signed or website-only mints. It answers at once and sends one summary when done.
 - Wallets added or removed from Telegram are saved and then replace `WATCH_ADDRESSES`. Changing that variable later has no effect until the saved state is cleared. Your own minter and funder addresses cannot be added, and the list holds up to 50 wallets. A new wallet is watched from the next block, with no replay.
 - `/cap` sets at most 1 native coin per chain. For a higher cap, change `MAX_MINT_ETH` or `MAX_MINT_<chainId>` in the host settings. A cap set from Telegram is saved and beats the variable.
 - Saved settings (pause, wallets, caps) live in the state file, so they only survive a restart if `STATE_PATH` is on a volume. Without one, the bot goes back to the variables.
