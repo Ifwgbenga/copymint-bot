@@ -73,6 +73,22 @@ MANUAL_CALLS = (
 )
 PRICE_VIEWS = ("mintPrice()", "price()", "cost()", "publicPrice()", "PRICE()", "salePrice()", "MINT_PRICE()")
 MAX_MANUAL_QTY = 200
+SNIPE_PREP_SECONDS = 5
+EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+
+
+def parse_countdown(tokens):
+    """Seconds from text like '10m', '90s', '1h30m' or 'in 10m'. None if it is not a countdown."""
+    tokens = list(tokens)
+    if tokens and tokens[0].lower() == "in":
+        tokens = tokens[1:]
+    text = "".join(tokens).lower()
+    match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", text.strip())
+    if not match or not any(match.groups()):
+        return None
+    hours, minutes, seconds = (int(g or 0) for g in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+
 NON_MINT = {
     selector("approve(address,uint256)"),
     selector("transfer(address,uint256)"),
@@ -229,6 +245,7 @@ MENU = (
     ("balance", "💰 Native balance on each chain"),
     ("cap", "🎯 Show or set the mint cap"),
     ("mint", "🎟 Mint a contract with all minters"),
+    ("snipe", "🎯 Schedule a timed mint"),
     ("help", "ℹ️ List every command"),
 )
 
@@ -559,6 +576,11 @@ class Bot:
         self.wss_backup_scan = flag("WSS_BACKUP_SCAN")
         # Chains whose socket just connected or dropped; they get one full catch-up scan.
         self.ws_gap = set()
+        self.snipe_retry = max(0.1, float(env("SNIPE_RETRY_SECONDS", "0.5")))
+        self.snipe_window = max(1.0, float(env("SNIPE_WINDOW_SECONDS", "10")))
+        self.snipe_plan = None
+        self.snipe_cancel = threading.Event()
+        self._snipe_lock = threading.Lock()
         self.ws_live = {}
         self.last_poll = {}
         self.watch_version = 0
@@ -816,6 +838,330 @@ class Bot:
             log(f"/mint {contract} {type(exc).__name__}: {exc}")
             notify(f"⚠️ /mint failed: {type(exc).__name__}")
 
+    def mint_functions_in(self, chain_id, contract):
+        """Known mint functions found in the contract's code, following a proxy to its implementation."""
+        code_at = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"]) or "0x"
+        blobs = [code_at.lower()]
+        implementation = None
+        if code_at.lower().startswith("0x363d3d373d3d3d363d73") and len(code_at) >= 62:
+            implementation = "0x" + code_at[22:62]
+        else:
+            try:
+                slot = self.rpc.call(chain_id, "eth_getStorageAt", [to_checksum_address(contract), EIP1967_IMPLEMENTATION_SLOT, "latest"])
+                if slot and int(slot, 16):
+                    implementation = "0x" + slot[-40:]
+            except Exception:
+                pass
+        if implementation:
+            try:
+                blobs.append((self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(implementation), "latest"]) or "0x").lower())
+            except Exception:
+                pass
+        joined = "".join(blobs)
+        return [(sig, layout) for sig, layout in MANUAL_CALLS if selector(sig)[2:] in joined]
+
+    def snipe_call_data(self, signature, layout, qty, minter):
+        words = "".join(f"{qty:064x}" if kind == "q" else "0" * 24 + minter[2:].lower() for kind in layout)
+        return selector(signature) + words
+
+    def build_snipe_plan(self, chain_id, contract, qty, price_wei, delay, override=None):
+        """Work out the mint call, price and gas before the mint opens. Returns (plan, error)."""
+        found = [(sig, layout) for sig, layout in self.mint_functions_in(chain_id, contract) if not (sig == "mint()" and qty != 1)]
+        if not found:
+            return None, "⚠️ I could not find a standard mint function in that contract, so I cannot prepare it. Use /mint once the mint is open."
+        if override:
+            matches = [item for item in found if item[0] == override]
+            if not matches:
+                names = ", ".join(sig for sig, _ in found)
+                return None, f"⚠️ {override} was not found in that contract. Functions I can use: {names}."
+            found = matches
+        signature, layout = found[0]
+        others = [sig for sig, _ in found[1:]]
+        if price_wei is None:
+            unit = 0
+            for view in PRICE_VIEWS:
+                try:
+                    unit = as_int(self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(contract), "data": selector(view)}, "latest"]))
+                except Exception:
+                    continue
+                if unit:
+                    break
+            value = unit * qty
+        else:
+            value = price_wei * qty
+        if value > self.cap(chain_id):
+            return None, (
+                f"⚠️ The total price {fmt_native(value, chain_id)} is above your cap of {fmt_native(self.cap(chain_id), chain_id)}. "
+                "Raise it with /cap first."
+            )
+        first = self.minters[0]
+        data = self.snipe_call_data(signature, layout, qty, first.address)
+        gas_note = "default"
+        try:
+            estimate = as_int(self.rpc.call(chain_id, "eth_estimateGas", [{"from": first.address, "to": to_checksum_address(contract), "data": data, "value": hex(value)}]))
+            gas, gas_note = int(estimate * 1.5) + 20_000, "estimated"
+        except Exception:
+            gas = 100_000 + 120_000 * qty
+        fee, _tip = self.fees(chain_id)
+        attempts = int(self.snipe_window / self.snipe_retry) + 1
+        plan = {
+            "chain": chain_id,
+            "contract": contract,
+            "qty": qty,
+            "value": value,
+            "signature": signature,
+            "layout": layout,
+            "gas": gas,
+            "gas_note": gas_note,
+            "fire_at": time.time() + delay,
+            "attempts": attempts,
+            "worst": attempts * gas * fee,
+            "others": others,
+            "state": "planned",
+        }
+        return plan, None
+
+    def snipe_plan_text(self, plan):
+        chain = self.chains[plan["chain"]]
+        seconds = max(0, int(plan["fire_at"] - time.time()))
+        gas_line = (
+            f"gas limit {plan['gas']:,} (estimated from the contract)"
+            if plan["gas_note"] == "estimated"
+            else f"gas limit {plan['gas']:,} (default: the mint is not open yet, so it cannot be estimated)"
+        )
+        price = "free" if plan["value"] == 0 else f"{fmt_native(plan['value'], plan['chain'])} per minter"
+        return (
+            f"🎯 Snipe plan · {chain.name}\n"
+            f"Contract: {plan['contract']}\n"
+            f"Call: {plan['signature']}, {plan['qty']} each, {price}\n"
+            + (f"Other mint functions found: {', '.join(plan['others'])}. Add fn=NAME(types) to the command to pick another.\n" if plan.get("others") else "")
+            + f"Minters: {len(self.minters)}\n"
+            f"Starts in: {seconds}s\n"
+            f"Sends at the start, then retries every {self.snipe_retry:g}s for up to {self.snipe_window:g}s, "
+            f"at most {plan['attempts']} tries per minter\n"
+            f"{gas_line}\n"
+            f"Worst case if every try fails: about {fmt_native(plan['worst'], plan['chain'])} in gas per minter\n"
+            + ("Dry run is on: nothing will be sent\n" if self.dry else "")
+            + "\nSend /snipe confirm to arm it, or /snipe cancel."
+        )
+
+    def snipe_command(self, args):
+        args = list(args)
+        usage = (
+            "✏️ Usage: /snipe [CHAIN_ID] 0xCONTRACT QTY PRICE TIME\n"
+            "PRICE is per NFT in the chain's coin, or auto to read it from the contract.\n"
+            "TIME is a countdown such as 10m, 90s or 1h30m.\n"
+            "Example: /snipe 4663 0xabc… 2 0.001 10m\n"
+            "Then /snipe confirm to arm it, or /snipe cancel."
+        )
+        if not args:
+            plan = self.snipe_plan
+            if plan:
+                return f"State: {plan['state']}\n" + self.snipe_plan_text(plan)
+            return usage
+        word = args[0].lower()
+        if word == "cancel":
+            with self._snipe_lock:
+                plan, self.snipe_plan = self.snipe_plan, None
+            if not plan:
+                return "Nothing is scheduled."
+            self.snipe_cancel.set()
+            return "🛑 Snipe cancelled."
+        if word == "confirm":
+            with self._snipe_lock:
+                plan = self.snipe_plan
+                if not plan or plan["state"] != "planned":
+                    return "There is no plan waiting for confirmation. Create one with /snipe first."
+                if plan["fire_at"] - time.time() < SNIPE_PREP_SECONDS + 3:
+                    self.snipe_plan = None
+                    return "⚠️ Too late: the start is less than 10 seconds away. Send the /snipe command again with a longer countdown."
+                plan["state"] = "armed"
+                self.snipe_cancel.clear()
+            threading.Thread(target=self.run_snipe, args=(plan,), daemon=True).start()
+            return f"✅ Armed. It will fire in {int(plan['fire_at'] - time.time())}s. Send /snipe cancel to stop it."
+        if self.snipe_plan and self.snipe_plan["state"] == "armed":
+            return "A snipe is already armed. Send /snipe cancel first."
+        override = None
+        for token in list(args):
+            if token.lower().startswith("fn="):
+                override = token[3:]
+                args.remove(token)
+        if len(args) >= 2 and args[-2].lower() == "in":
+            delay, args = parse_countdown(args[-2:]), args[:-2]
+        else:
+            delay, args = parse_countdown(args[-1:]), args[:-1]
+        if delay is None:
+            return "⚠️ I could not read the countdown.\n" + usage
+        if delay < SNIPE_PREP_SECONDS + 10:
+            return "⚠️ The countdown must be at least 15 seconds."
+        chain_id = None
+        if args and args[0].isdigit():
+            chain_id = int(args.pop(0))
+            if chain_id not in self.chains:
+                return f"⚠️ Chain {chain_id} is not enabled."
+        elif len(self.chains) == 1:
+            chain_id = next(iter(self.chains))
+        else:
+            return "⚠️ Start with the chain ID, for example /snipe 4663 0xabc… 1 0.001 10m"
+        if len(args) < 3:
+            return usage
+        contract = valid_address(args[0])
+        if contract is None:
+            return "⚠️ That is not a valid contract address.\n" + usage
+        try:
+            qty = int(args[1])
+        except ValueError:
+            return "⚠️ Quantity must be a whole number.\n" + usage
+        if not 1 <= qty <= MAX_MANUAL_QTY:
+            return f"⚠️ Quantity must be between 1 and {MAX_MANUAL_QTY}."
+        price_wei = None
+        if args[2].lower() != "auto":
+            try:
+                price = Decimal(args[2])
+            except Exception:
+                return "⚠️ Price must be a number, or auto.\n" + usage
+            if not price.is_finite() or price < 0:
+                return "⚠️ Price must be zero or more."
+            price_wei = to_wei(price)
+        try:
+            code_at = self.rpc.call(chain_id, "eth_getCode", [to_checksum_address(contract), "latest"])
+        except Exception:
+            return "⚠️ Could not reach the chain's RPC. Try again."
+        if not code_at or code_at in ("0x", "0x0"):
+            return "⚠️ There is no contract at that address on this chain."
+        try:
+            plan, error = self.build_snipe_plan(chain_id, contract, qty, price_wei, delay, override)
+        except Exception as exc:
+            log(f"snipe plan {type(exc).__name__}: {exc}")
+            return "⚠️ Could not prepare the plan. Try again."
+        if error:
+            return error
+        with self._snipe_lock:
+            self.snipe_plan = plan
+        return self.snipe_plan_text(plan)
+
+    def snipe_wait(self, moment):
+        """Sleep until the moment. Returns False if the snipe was cancelled first."""
+        while True:
+            remaining = moment - time.time()
+            if remaining <= 0:
+                return not self.snipe_cancel.is_set()
+            if self.snipe_cancel.wait(min(remaining, 0.25 if remaining > 0.5 else 0.002)):
+                return False
+
+    def snipe_sign(self, chain_id, acct, plan, nonce, fee, tip):
+        data = self.snipe_call_data(plan["signature"], plan["layout"], plan["qty"], acct.address)
+        signed = acct.sign_transaction(
+            {
+                "chainId": chain_id,
+                "nonce": nonce,
+                "gas": plan["gas"],
+                "maxFeePerGas": fee,
+                "maxPriorityFeePerGas": tip,
+                "to": to_checksum_address(plan["contract"]),
+                "value": plan["value"],
+                "data": data,
+                "type": 2,
+            }
+        )
+        return "0x" + signed.raw_transaction.hex()
+
+    def snipe_worker(self, acct, plan, nonce, fee, tip, first_raw, deadline, report):
+        """Send one minter's mint at the start, then retry after each reverted try until it lands or time runs out."""
+        chain_id = plan["chain"]
+        who = acct.address.lower()
+        failed, last, reason = [], None, "did not land in time"
+        raw = first_raw
+        while True:
+            if last is None:
+                try:
+                    if raw is None:
+                        raw = self.snipe_sign(chain_id, acct, plan, nonce, fee, tip)
+                    last = self.rpc.call(chain_id, "eth_sendRawTransaction", [raw])
+                except Exception as exc:
+                    reason = f"sending failed: {str(exc)[:80]}"
+                    log(f"snipe {acct.address[:8]} {reason}")
+                    last = None
+                    if "nonce" in str(exc).lower():
+                        try:
+                            nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+                        except Exception:
+                            pass
+                raw = None
+            else:
+                try:
+                    receipt = self.rpc.call(chain_id, "eth_getTransactionReceipt", [last])
+                except Exception:
+                    receipt = None
+                if receipt:
+                    if as_int(receipt.get("status", "0x1")) == 1:
+                        report[who] = {"status": "minted", "txh": last, "value": plan["value"], "failed_txs": failed}
+                        self.remember_minted(chain_id, acct.address, {plan["contract"]: plan["qty"]})
+                        return
+                    failed.append(last)  # reverted, most likely because the mint is not open yet
+                    reason = "every try reverted"
+                    nonce += 1
+                    last = None
+                    if time.time() < deadline:
+                        continue
+            if time.time() >= deadline:
+                break
+            time.sleep(self.snipe_retry)
+        record = {"status": "failed", "reason": reason, "failed_txs": failed}
+        if last:
+            record["reason"] = "the last try had not confirmed when time ran out"
+            record["failed_txs"] = failed
+        report[who] = record
+
+    def run_snipe(self, plan):
+        chain_id = plan["chain"]
+        contract = plan["contract"]
+        chain = self.chains[chain_id]
+        report = {}
+        try:
+            fee, tip = self.fees(chain_id)
+            active = []
+            for acct in self.minters:
+                if self.snipe_cancel.is_set():
+                    return
+                if self.ensure(acct, chain_id, plan["value"] + plan["gas"] * fee * 3):
+                    active.append(acct)
+                else:
+                    report[acct.address.lower()] = {"status": "failed", "reason": "not enough funds and no bridge route"}
+            if not self.snipe_wait(plan["fire_at"] - SNIPE_PREP_SECONDS):
+                return
+            if self.dry:
+                for acct in active:
+                    report[acct.address.lower()] = {"status": "dry"}
+                    log(f"🧪 DRY snipe {acct.address} {plan['signature']} x{plan['qty']} on {chain.name}")
+            else:
+                self.rpc.call(chain_id, "eth_chainId", [])  # keeps the connection warm
+                fee, tip = self.fees(chain_id)
+                prepared = []
+                for acct in active:
+                    nonce = int(self.rpc.call(chain_id, "eth_getTransactionCount", [acct.address, "pending"]), 16)
+                    prepared.append((acct, nonce, self.snipe_sign(chain_id, acct, plan, nonce, fee, tip)))
+                if not self.snipe_wait(plan["fire_at"]):
+                    return
+                deadline = time.time() + self.snipe_window
+                with self._copy_lock:
+                    with ThreadPoolExecutor(max_workers=max(1, len(prepared))) as pool:
+                        jobs = [
+                            pool.submit(self.snipe_worker, acct, plan, nonce, fee, tip, raw, deadline, report)
+                            for acct, nonce, raw in prepared
+                        ]
+                        for job in jobs:
+                            job.result()
+            tx = {"hash": f"snipe-{int(plan['fire_at'])}", "from": "manual", "to": contract}
+            self.send_summary(chain_id, tx, {contract: plan["qty"]}, {"report": report}, kind="snipe")
+        except Exception as exc:
+            log(f"snipe {type(exc).__name__}: {exc}")
+            notify(f"⚠️ Snipe failed: {type(exc).__name__}")
+        finally:
+            with self._snipe_lock:
+                if self.snipe_plan is plan:
+                    self.snipe_plan = None
+
     def cap_command(self, args):
         if not args:
             rows = [f"• {chain.name} ({cid}): {self.cap(cid) / 1e18:g}" for cid, chain in self.chains.items()]
@@ -897,6 +1243,8 @@ class Bot:
             return self.cap_command(args)
         if command == "/mint":
             return self.mint_command(args)
+        if command == "/snipe":
+            return self.snipe_command(args)
         if command in ("/help", "/start"):
             lines = ["Tap / to open the menu.\n"]
             lines.extend(f"/{name}  {text}" for name, text in MENU)
@@ -1331,7 +1679,7 @@ class Bot:
         except Exception:
             return None
 
-    def send_summary(self, chain_id, tx, want, item, gave_up=False, note=""):
+    def send_summary(self, chain_id, tx, want, item, gave_up=False, note="", kind="copy"):
         """One Telegram message for a finished mint: who copied, who didn't, why, and what it cost."""
         chain = self.chains[chain_id]
         report = item.get("report") or {}
@@ -1344,16 +1692,17 @@ class Bot:
             log(f"{chain.name} {tx['hash']}: nothing to report, every minter had already minted this collection")
             return
         per_minter = sum(want.values())
+        sniped = kind == "snipe"
         if minted and len(minted) == total:
-            title, mood = "✅ Copied", "ok"
+            title, mood = ("🎯 Sniped" if sniped else "✅ Copied"), "ok"
         elif minted:
-            title, mood = "⚠️ Partially copied", "partial"
+            title, mood = ("⚠️ Partially sniped" if sniped else "⚠️ Partially copied"), "partial"
         elif dry:
             title, mood = "🧪 Dry run", "dry"
         elif gave_up:
             title, mood = "🛑 Gave up", "bad"
         else:
-            title, mood = "❌ Not copied", "bad"
+            title, mood = ("❌ Missed" if sniped else "❌ Not copied"), "bad"
         names = [self.collection_name(chain_id, c) for c in want]
         if len(want) == 1:
             collection_rows = [
@@ -1370,18 +1719,21 @@ class Bot:
             reasons[record.get("reason") or "did not land"] = reasons.get(record.get("reason") or "did not land", 0) + 1
         skipped_text = "\n".join(f"• {count} minter(s): {esc(reason)}" for reason, count in reasons.items())
         costs = [self.mint_cost(chain_id, r["txh"], r.get("value")) for r in minted if r.get("txh")]
+        # Attempts that reverted still cost gas, so they count toward the total.
+        for record in report.values():
+            costs += [self.mint_cost(chain_id, h, 0) for h in record.get("failed_txs") or []]
         costs = [c for c in costs if c is not None]
         done_count = len(minted) or len(dry)
         rows = collection_rows + [
             ("Minted" if minted else None, f"{per_minter * len(minted)} NFTs across {len(minted)} minter(s)" if minted else None),
             ("Would mint" if dry and not minted else None, f"{per_minter * len(dry)} NFTs across {len(dry)} minter(s)" if dry and not minted else None),
-            ("Minters copied", f"{done_count} of {total}"),
+            ("Minters minted" if sniped else "Minters copied", f"{done_count} of {total}"),
             ("Skipped", ("\n" + skipped_text) if skipped_text else None),
             ("Already minted", f"{len(quiet)} minter(s), limit reached" if quiet and (minted or problems) else None),
             ("Note", esc(note) if note else None),
             ("Total cost", fmt_native(sum(costs), chain_id) if costs else None),
-            ("Source wallet", code(tx["from"])),
-            ("Source tx", code(tx["hash"])),
+            ("Source wallet", code(tx["from"]) if tx["from"] != "manual" else None),
+            ("Source tx", code(tx["hash"]) if tx["from"] != "manual" else None),
         ]
         rows = [(label, value) for label, value in rows if label]
         plain = f"{title} on {chain.name}: {done_count} of {total} minters, source {tx['hash']}"
