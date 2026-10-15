@@ -114,3 +114,66 @@ class SignedAndAllowlistCalls(unittest.TestCase):
         for other in chosen[1:]:
             self.assertIsNone(other)
         self.assertIn("not eligible", b.last_pick_reason)
+
+
+class RealRevertReasons(unittest.TestCase):
+    def test_decodes_error_string(self):
+        from eth_abi import encode
+        data = "0x08c379a0" + encode(["string"], ["Sold out"]).hex()
+        self.assertEqual(bot.decode_revert(data), 'the contract said "Sold out"')
+        self.assertTrue(bot.classify_reason(bot.decode_revert(data)).startswith("sold out"))
+
+    def test_decodes_known_custom_error(self):
+        self.assertEqual(bot.decode_revert(bot.selector("MaxSupplyReached()")), "sold out")
+        self.assertIn("not open", bot.decode_revert(bot.selector("MintNotStarted()")))
+
+    def test_decodes_panic_and_message_only(self):
+        panic = "0x4e487b71" + "11".rjust(64, "0")
+        self.assertIn("0x11", bot.decode_revert(panic))
+        self.assertEqual(bot.decode_revert("", "execution reverted: Mint closed"), 'the contract said "Mint closed"')
+        self.assertEqual(bot.decode_revert("", "execution reverted"), "")
+
+    def test_sold_out_is_read_from_the_contract(self):
+        b = make_bot()
+        collection = "0x" + "ee" * 20
+        word = "0x" + (1000).to_bytes(32, "big").hex()
+
+        def call(chain_id, method, params):
+            sel = params[0]["data"]
+            if sel in (bot.selector("totalSupply()"), bot.selector("maxSupply()")):
+                return word
+            raise RuntimeError("no such function")
+
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = call
+        self.assertEqual(b.explain_revert(1, [(collection, None)]), "sold out: 1000 of 1000 minted")
+
+    def test_pick_reports_the_contract_reason(self):
+        from eth_abi import encode
+        b = make_bot()
+        collection = "0x" + "ee" * 20
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = RuntimeError("no such function")
+
+        def simulate(chain_id, acct, target, call, value):
+            b._revert = {"message": "execution reverted", "data": "0x08c379a0" + encode(["string"], ["Mint not live"]).hex()}
+            return None
+
+        b.simulate = simulate
+        self.assertIsNone(b.pick(1, b.minters[0], [(collection, "0xa0712d68" + "0" * 63 + "1", 0)], {collection: 1}))
+        self.assertIn("not open", b.last_pick_reason)
+        self.assertNotIn("price, allowlist, phase or supply", b.last_pick_reason)
+
+    def test_no_reason_is_said_plainly(self):
+        b = make_bot()
+        collection = "0x" + "ee" * 20
+        b.rpc = mock.Mock()
+        b.rpc.call.side_effect = RuntimeError("no such function")
+
+        def simulate(chain_id, acct, target, call, value):
+            b._revert = {"message": "execution reverted", "data": ""}
+            return None
+
+        b.simulate = simulate
+        b.pick(1, b.minters[0], [(collection, "0xa0712d68" + "0" * 63 + "1", 0)], {collection: 1})
+        self.assertEqual(b.last_pick_reason, "the mint reverted and the contract gave no reason")

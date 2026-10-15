@@ -14,6 +14,8 @@ It starts at the current block. It does not replay old mints.
 
 Allowlist and signed mints are tried too, but each minter is simulated on its own. A minter that is eligible on-chain (for example a wallet on the contract's allowlist) mints, and the others are skipped as "not eligible". A signature or Merkle proof made for the watched wallet still will not work for your minters, so those mints fail for everyone.
 
+When a minter's simulated mint reverts, the bot reads the contract to say why: sold out (minted count against its supply cap), paused, the contract's own revert message, or a known error such as mint not open, wallet limit, not allowlisted or wrong payment. If the contract gives no reason and exposes no supply, the message says so rather than guessing.
+
 ## Chains
 
 Ethereum, Optimism, BNB Chain, Polygon, Base, Arbitrum, HyperEVM, and Robinhood. Set `CHAINS` to the ones you want.

@@ -390,6 +390,78 @@ def looks_signed(data):
     return False
 
 
+REVERT_NAMES = {
+    "sold out": [
+        "SoldOut()", "MintedOut()", "MaxSupplyReached()", "ExceedsMaxSupply()", "MaxSupplyExceeded()",
+        "SupplyExceeded()", "NoMoreTokens()", "AllTokensMinted()", "CollectionSoldOut()",
+        "MintQuantityExceedsMaxSupply(uint256,uint256)", "ExceedsSupply()", "InsufficientSupply()",
+    ],
+    "the mint is not open (not started or already closed)": [
+        "NotStarted()", "MintNotStarted()", "MintNotOpen()", "SaleNotStarted()", "SaleNotActive()",
+        "SaleNotOpen()", "MintClosed()", "MintNotActive()", "MintInactive()", "NotOpen()", "SaleClosed()",
+        "NotActive(uint256,uint256,uint256)", "MintEnded()", "PublicSaleNotActive()",
+    ],
+    "the mint is paused": ["Paused()", "MintPaused()", "EnforcedPause()", "ContractPaused()"],
+    "wallet limit reached": [
+        "WalletLimitExceeded()", "MaxPerWalletExceeded()", "ExceedsWalletLimit()", "MaxMintsPerWalletExceeded()",
+        "MintQuantityExceedsMaxMintedPerWallet(uint256,uint256)", "MaxPerAddressExceeded()", "AlreadyClaimed()",
+    ],
+    "not on the allowlist for this phase": [
+        "NotAllowlisted()", "NotOnAllowlist()", "InvalidProof()", "NotWhitelisted()", "NotEligible()",
+        "InvalidMerkleProof()", "NotAllowed()",
+    ],
+    "wrong payment amount": [
+        "InsufficientPayment()", "IncorrectPayment()", "WrongPrice()", "IncorrectPayment(uint256,uint256)",
+        "InsufficientFunds()", "InvalidPayment()", "WrongPayment()",
+    ],
+}
+REVERT_BY_SELECTOR = {selector(sig): label for label, sigs in REVERT_NAMES.items() for sig in sigs}
+REVERT_WORDS = (
+    ("sold out", ("sold out", "soldout", "sold-out", "max supply", "exceeds max", "exceed max", "minted out", "no more", "all minted", "supply reached", "supply exceeded", "exceeds supply", "out of stock")),
+    ("the mint is paused", ("paused",)),
+    ("the mint is not open (not started or already closed)", ("not started", "not open", "not active", "not live", "closed", "has ended", "inactive", "not begun", "too early", "sale is not", "minting is not")),
+    ("not on the allowlist for this phase", ("allowlist", "whitelist", "merkle", "proof", "not eligible", "not allowed", "not authorized")),
+    ("wallet limit reached", ("per wallet", "per address", "wallet limit", "already minted", "already claimed", "max per", "limit reached", "exceeds limit")),
+    ("wrong payment amount", ("insufficient", "incorrect", "wrong price", "wrong value", "payment", "ether sent", "not enough")),
+)
+
+
+def decode_revert(data, message=""):
+    """Turn revert data and an RPC message into plain words. Returns "" when nothing readable is found."""
+    data = (data or "").strip()
+    message = str(message or "")
+    if not data.startswith("0x"):
+        match = re.search(r"0x[0-9a-fA-F]{8,}", message)
+        data = match.group(0) if match else ""
+    if len(data) >= 10:
+        sel = data[:10].lower()
+        if sel == "0x08c379a0":
+            try:
+                text = decode_abi_string("0x" + data[10:]).strip()
+            except Exception:
+                text = ""
+            if text:
+                return f"the contract said \"{text[:120]}\""
+        elif sel == "0x4e487b71":
+            code = data[10:74].lstrip("0") or "0"
+            return f"the contract hit an internal error (panic code 0x{code})"
+        elif sel in REVERT_BY_SELECTOR:
+            return REVERT_BY_SELECTOR[sel]
+    text = re.sub(r"^.*?(execution reverted:?|reverted:?)", "", message, flags=re.I).strip(" :\"'")
+    if text and not text.lower().startswith(("0x", "execution")):
+        return f"the contract said \"{text[:120]}\""
+    return ""
+
+
+def classify_reason(text):
+    """Map a decoded revert sentence onto one of the plain labels when it clearly means one."""
+    lower = text.lower()
+    for label, words in REVERT_WORDS:
+        if any(word in lower for word in words):
+            return f"{label} ({text})" if text.startswith("the contract said") else label
+    return text
+
+
 def single_qty(data):
     if not data or len(data) < 2 + 128:
         return 1
@@ -1564,7 +1636,17 @@ class Bot:
         # during the swap would be overwritten when the old set was restored.
         return self.minted_map(logs, {recipient.lower()})
 
+    def _note_revert(self, error, data=None):
+        message = ""
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+            data = data or error.get("data") or error.get("output")
+        elif error:
+            message = str(error)
+        self._revert = {"message": message, "data": data if isinstance(data, str) else ""}
+
     def simulate(self, chain_id, acct, target, data, value):
+        self._revert = None
         call = {
             "from": acct.address,
             "to": to_checksum_address(target),
@@ -1594,6 +1676,7 @@ class Bot:
                 if calls:
                     if calls[0].get("error"):
                         status = 0
+                        self._note_revert(calls[0].get("error"), calls[0].get("returnData") or calls[0].get("data"))
                     elif calls[0].get("status") is not None:
                         status = as_int(calls[0].get("status"))
                     gas_used = as_int(calls[0].get("gasUsed"))
@@ -1606,6 +1689,7 @@ class Bot:
             if not method_missing(exc):
                 text = str(exc).lower()
                 if "revert" in text or "execution" in text:
+                    self._note_revert(str(exc))
                     return None
                 if not method_missing(exc):
                     log(f"simulate {exc}")
@@ -1628,9 +1712,11 @@ class Bot:
             if method_missing(exc):
                 return "unsupported"
             if "revert" in str(exc).lower():
+                self._note_revert(str(exc))
                 return None
             return "unsupported"
         if isinstance(result, dict) and result.get("error"):
+            self._note_revert(result.get("error"), result.get("output"))
             return None
         logs = []
         collect_logs(result, logs)
@@ -1806,12 +1892,60 @@ class Bot:
         log(f"{acct.address[:8]} RPC cannot show mint logs, using the gas estimate")
         return value, target, data, est
 
+    def read_uint(self, chain_id, target, signature):
+        try:
+            raw = self.rpc.call(chain_id, "eth_call", [{"to": to_checksum_address(target), "data": selector(signature)}, "latest"])
+            if isinstance(raw, str) and len(raw) >= 66:
+                return int(raw[:66], 16)
+        except Exception:
+            pass
+        return None
+
+    def supply_state(self, chain_id, target):
+        """Minted count, supply cap and paused flag read from the contract, cached for a few seconds."""
+        cache = self.__dict__.setdefault("_supply_cache", {})
+        key = (chain_id, target.lower())
+        hit = cache.get(key)
+        if hit and time.time() - hit[0] < 5:
+            return hit[1]
+        minted = None
+        for sig in ("totalSupply()", "totalMinted()"):
+            value = self.read_uint(chain_id, target, sig)
+            if value is not None:
+                minted = value if minted is None else max(minted, value)
+        cap = None
+        for sig in ("maxSupply()", "MAX_SUPPLY()", "maxTokens()", "MAX_TOKENS()", "collectionSize()", "maxTotalSupply()", "supplyCap()"):
+            value = self.read_uint(chain_id, target, sig)
+            if value:
+                cap = value
+                break
+        paused = self.read_uint(chain_id, target, "paused()")
+        state = {"minted": minted, "cap": cap, "paused": bool(paused)}
+        cache[key] = (time.time(), state)
+        return state
+
+    def explain_revert(self, chain_id, reverts):
+        """The real reason a simulated mint reverted. reverts is a list of (target, revert info)."""
+        reasons = []
+        for target, info in reverts:
+            state = self.supply_state(chain_id, target)
+            if state["cap"] and state["minted"] is not None and state["minted"] >= state["cap"]:
+                return f"sold out: {state['minted']} of {state['cap']} minted"
+            if state["paused"]:
+                reasons.append("the mint is paused")
+            info = info or {}
+            text = decode_revert(info.get("data"), info.get("message"))
+            if text:
+                reasons.append(classify_reason(text))
+        return reasons[0] if reasons else ""
+
     def pick(self, chain_id, acct, options, want):
         saw_real = False
         unsupported = False
         best = None
         reverted = 0
         different = 0
+        reverts = []
         self.last_pick_reason = ""
         self.last_pick_kind = ""
         for target, raw, hinted in options:
@@ -1828,6 +1962,7 @@ class Bot:
                 saw_real = True
                 if not result:
                     reverted += 1
+                    reverts.append((target, getattr(self, "_revert", None)))
                     continue
                 logs, gas_used = result
                 if self.minted_for(logs, acct.address) != want:
@@ -1843,8 +1978,15 @@ class Bot:
             self.last_pick_reason = "the simulated mint did not give the same NFTs as the source wallet got"
         elif reverted:
             self.last_pick_kind = "reverted"
-            self.last_pick_reason = "the simulated mint reverted for this minter (price, allowlist, phase or supply)"
-            if any(looks_signed(raw) or raw[:10].lower() == SEADROP_MINT_SIGNED for _t, raw, _v in options):
+            self.last_pick_reason = "the mint reverted and the contract gave no reason"
+            try:
+                explained = self.explain_revert(chain_id, reverts)
+            except Exception as exc:
+                log(f"explain revert {exc}")
+                explained = ""
+            if explained:
+                self.last_pick_reason = explained
+            elif any(looks_signed(raw) or raw[:10].lower() == SEADROP_MINT_SIGNED for _t, raw, _v in options):
                 self.last_pick_reason = "not eligible: the mint needs a signature or allowlist proof made for the source wallet"
         if not saw_real and unsupported:
             self.last_pick_kind = "unsupported"
