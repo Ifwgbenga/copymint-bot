@@ -130,6 +130,7 @@ CHAINS = {
     42161: ("Arbitrum", "https://arbitrum.publicnode.com"),
     999: ("HyperEVM", "https://rpc.hyperliquid.xyz/evm"),
     4663: ("Robinhood", "https://rpc.mainnet.chain.robinhood.com"),
+    57073: ("Ink", "https://rpc-gel.inkonchain.com."),
 }
 
 
