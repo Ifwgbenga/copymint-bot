@@ -6,13 +6,13 @@
 
 Watches one or more wallets. When one of them mints an NFT to itself, your wallets send that same mint for the same quantity.
 
-A copy is taken from the mint call only, including a mint buried in a multicall. Signature and allowlist calls are skipped. The bot simulates the copy first and broadcasts only when that simulation mints the same collection and quantity. A send that does not land is retried. If it is still pending after two blocks, it is replaced once with a higher fee.
+A copy is taken from the mint call only, including a mint buried in a multicall. The bot simulates the copy first and broadcasts only when that simulation mints the same collection and quantity. A send that does not land is retried. If it is still pending after two blocks, it is replaced once with a higher fee.
 
 If a minter does not have enough native coin on that chain, the bot swaps or bridges funds in with [LI.FI](https://li.quest) from another chain, then mints. A separate funder wallet can pay for the minters.
 
 It starts at the current block. It does not replay old mints.
 
-Signed allowlist mints cannot be copied. The signature is locked to the watched wallet, the copied call reverts, and that wallet is skipped.
+Allowlist and signed mints are tried too, but each minter is simulated on its own. A minter that is eligible on-chain (for example a wallet on the contract's allowlist) mints, and the others are skipped as "not eligible". A signature or Merkle proof made for the watched wallet still will not work for your minters, so those mints fail for everyone.
 
 ## Chains
 

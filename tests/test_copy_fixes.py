@@ -75,3 +75,42 @@ class Explanations(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SignedAndAllowlistCalls(unittest.TestCase):
+    def test_signed_looking_call_is_still_a_candidate(self):
+        from eth_abi import encode
+        data = "0x12345678" + encode(["uint256", "bytes"], [1, b"\x01" * 64 + b"\x1b"]).hex()
+        self.assertTrue(bot.looks_signed(data))
+        b = make_bot()
+        source = {"hash": "0xs", "from": "0x" + "ab" * 20, "to": "0x" + "ee" * 20, "value": "0x0", "input": data}
+        self.assertEqual(len(b.candidates(source, {"0x" + "ee" * 20: 1})), 1)
+
+    def test_only_the_eligible_minter_sends(self):
+        from eth_abi import encode
+        data = "0x12345678" + encode(["uint256", "bytes"], [1, b"\x01" * 64 + b"\x1b"]).hex()
+        values = {
+            "WATCH_ADDRESSES": WATCHED,
+            "MINTER_PRIVATE_KEYS": TEST_KEY + ",0x" + "22" * 32 + ",0x" + "33" * 32,
+            "CHAINS": "1",
+            "STATE_PATH": os.path.join(tempfile.mkdtemp(), "state.json"),
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            b = bot.Bot()
+        collection = "0x" + "ee" * 20
+        eligible = b.minters[0].address.lower()
+        sims = []
+
+        def simulate(chain_id, acct, target, call, value):
+            sims.append(acct.address.lower())
+            if acct.address.lower() != eligible:
+                return None
+            return [], 100_000
+
+        b.simulate = simulate
+        b.minted_for = lambda logs, who: {collection: 1} if who.lower() == eligible else {}
+        chosen = [b.pick(1, acct, [(collection, data, 0)], {collection: 1}) for acct in b.minters]
+        self.assertIsNotNone(chosen[0])
+        for other in chosen[1:]:
+            self.assertIsNone(other)
+        self.assertIn("not eligible", b.last_pick_reason)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Watch wallets. When one mints an NFT to itself, mint the same quantity.
 
-The copy is the mint call only. Signature and allowlist calls are skipped.
+The copy is the mint call only. Signature and allowlist calls are tried too, and each minter is simulated on its own, so only eligible minters send.
 It is broadcast only when a simulation shows the minter receives the same
 collection and quantity. A send that does not land is retried, and the
 transaction is replaced once if it is still pending after two blocks.
@@ -1650,8 +1650,11 @@ class Bot:
                 if value > 0 and target.lower() in collections:
                     kept.append((target, "0x", value))
                 continue
-            if data[:10].lower() in NON_MINT or looks_signed(data):
+            if data[:10].lower() in NON_MINT:
                 continue
+            # A call that looks signed or allowlisted is kept. Whether a minter is eligible is
+            # decided by simulating the call from that minter, so an eligible wallet can still mint
+            # while the others are skipped.
             kept.append((target, data, value))
         return kept
 
@@ -1841,6 +1844,8 @@ class Bot:
         elif reverted:
             self.last_pick_kind = "reverted"
             self.last_pick_reason = "the simulated mint reverted for this minter (price, allowlist, phase or supply)"
+            if any(looks_signed(raw) or raw[:10].lower() == SEADROP_MINT_SIGNED for _t, raw, _v in options):
+                self.last_pick_reason = "not eligible: the mint needs a signature or allowlist proof made for the source wallet"
         if not saw_real and unsupported:
             self.last_pick_kind = "unsupported"
             self.last_pick_reason = "your RPC cannot simulate; set a node with eth_simulateV1 or debug_traceCall"
