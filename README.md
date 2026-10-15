@@ -1,5 +1,7 @@
 # Copymint bot
 
+> **Use at your own risk.** This bot signs and sends real transactions from the private keys you give it. Use fresh wallets that hold only what you can afford to lose, never your main wallet. Start with `DRY_RUN=true`. Mints can fail, copy the wrong thing, or be scams, and nothing here is financial advice. Never commit a `.env` file or share your keys, RPC URLs or Telegram bot token.
+
 Watches one or more wallets. When one of them mints an NFT to itself, your wallets send that same mint for the same quantity.
 
 A copy is taken from the mint call only, including a mint buried in a multicall. Signature and allowlist calls are skipped. The bot simulates the copy first and broadcasts only when that simulation mints the same collection and quantity. A send that does not land is retried. If it is still pending after two blocks, it is replaced once with a higher fee.
