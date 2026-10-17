@@ -863,7 +863,7 @@ class Bot:
         elif len(self.chains) == 1:
             chain_id = next(iter(self.chains))
         else:
-            return "⚠️ Start with the chain ID, for example /mint 4663 0xabc… 1"
+            chain_id = 4663 if 4663 in self.chains else next(iter(self.chains))
         contract = valid_address(args[0]) if args else None
         if contract is None:
             return "⚠️ That is not a valid contract address.\n" + usage
