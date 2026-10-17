@@ -1814,7 +1814,11 @@ class Bot:
             costs += [self.mint_cost(chain_id, h, 0) for h in record.get("failed_txs") or []]
         costs = [c for c in costs if c is not None]
         done_count = len(minted) or len(dry)
-        rows = collection_rows + [
+        slugs = {1: "ethereum", 10: "optimism", 56: "bsc", 137: "matic", 8453: "base", 42161: "arbitrum", 999: "hyperevm", 4663: "robinhood", 57073: "ink"}
+        link_rows = [("OpenSea", '<a href="https://opensea.io/assets/' + slugs.get(chain_id, "") + "/" + addr + '">View</a>') for addr in want]
+        explorers = {1: "etherscan.io", 10: "optimistic.etherscan.io", 56: "bscscan.com", 137: "polygonscan.com", 8453: "basescan.org", 42161: "arbiscan.io", 999: "hyperevmscan.io", 4663: "robinhoodchain.blockscout.com", 57073: "explorer.inkonchain.com"}
+        link_rows += [("Explorer", '<a href="https://' + explorers.get(chain_id, "") + "/address/" + addr + '">View</a>') for addr in want]
+        rows = collection_rows + link_rows + [
             ("Minted" if minted else None, f"{per_minter * len(minted)} NFTs across {len(minted)} minter(s)" if minted else None),
             ("Would mint" if dry and not minted else None, f"{per_minter * len(dry)} NFTs across {len(dry)} minter(s)" if dry and not minted else None),
             ("Minters minted" if sniped else "Minters copied", f"{done_count} of {total}"),
