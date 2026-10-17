@@ -1331,6 +1331,21 @@ class Bot:
         parts = (message.get("text") or "").strip().split()
         if not parts:
             return
+        text = parts[0].lower()
+        pending = getattr(self, "mint_confirm", None)
+        if pending and pending[1] + 120 < time.time():
+            pending = self.mint_confirm = None
+        if text.startswith("0x") and len(parts[0]) == 42:
+            self.mint_confirm = (parts[0], time.time())
+            notify("Mint " + parts[0] + "? Reply with how many to mint (a number), or no to cancel. Expires in 2 minutes.")
+            return
+        if pending and text == "no":
+            self.mint_confirm = None
+            notify("Cancelled.")
+            return
+        if pending and (text.isdigit() or text in ("yes", "y")):
+            self.mint_confirm = None
+            parts = ["/mint", pending[0], text if text.isdigit() else "1"]
         reply = self.command_reply(parts[0].split("@")[0].lower(), parts[1:])
         if reply:
             log(f"telegram command {parts[0].split('@')[0]}")
