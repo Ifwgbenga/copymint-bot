@@ -1835,7 +1835,9 @@ class Bot:
         link_rows = [("OpenSea", '<a href="https://opensea.io/assets/' + slugs.get(chain_id, "") + "/" + addr + '">View</a>') for addr in want]
         explorers = {1: "etherscan.io", 10: "optimistic.etherscan.io", 56: "bscscan.com", 137: "polygonscan.com", 8453: "basescan.org", 42161: "arbiscan.io", 999: "hyperevmscan.io", 4663: "robinhoodchain.blockscout.com", 57073: "explorer.inkonchain.com"}
         link_rows += [("Explorer", '<a href="https://' + explorers.get(chain_id, "") + "/address/" + addr + '">View</a>') for addr in want]
-        rows = collection_rows + link_rows + [
+        first_ca = next(iter(want))
+        buttons = [{"text": "OpenSea", "url": "https://opensea.io/assets/" + slugs.get(chain_id, "") + "/" + first_ca}, {"text": "Explorer", "url": "https://" + explorers.get(chain_id, "") + "/address/" + first_ca}]
+        rows = collection_rows + [
             ("Minted" if minted else None, f"{per_minter * len(minted)} NFTs across {len(minted)} minter(s)" if minted else None),
             ("Would mint" if dry and not minted else None, f"{per_minter * len(dry)} NFTs across {len(dry)} minter(s)" if dry and not minted else None),
             ("Minters minted" if sniped else "Minters copied", f"{done_count} of {total}"),
@@ -1848,7 +1850,7 @@ class Bot:
         ]
         rows = [(label, value) for label, value in rows if label]
         plain = f"{title} on {chain.name}: {done_count} of {total} minters, source {tx['hash']}"
-        alert(plain, card(f"{title} · {chain.name}", *rows))
+        alert(plain, card(f"{title} · {chain.name}", *rows) buttons=buttons)
 
     def remember_minted(self, chain_id, minter, want):
         """Note that this minter has minted these collections, so a later refusal is expected."""
