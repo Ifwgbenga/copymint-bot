@@ -1850,7 +1850,7 @@ class Bot:
         ]
         rows = [(label, value) for label, value in rows if label]
         plain = f"{title} on {chain.name}: {done_count} of {total} minters, source {tx['hash']}"
-        alert(plain, card(f"{title} · {chain.name}", *rows) buttons=buttons)
+        alert(plain, card(f"{title} · {chain.name}", *rows), buttons=buttons)
 
     def remember_minted(self, chain_id, minter, want):
         """Note that this minter has minted these collections, so a later refusal is expected."""
