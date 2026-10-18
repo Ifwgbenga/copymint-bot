@@ -180,13 +180,13 @@ def notify(message, html=False, buttons=None):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def alert(msg, rich=None):
+def alert(msg, rich=None, buttons=None):
     """Log plain text. Send the Telegram HTML version when one is given."""
     log(msg)
     if rich is None:
         notify(msg)
     else:
-        notify(rich, html=True)
+        notify(rich, html=True, buttons=buttons)
 
 
 def esc(value):
