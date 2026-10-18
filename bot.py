@@ -146,7 +146,8 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
-def notify(message, html=False):
+def notify(message, html=False, buttons=None):
+
     """Send a Telegram message when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
 
     Runs in a background thread so a slow Telegram never delays a mint, and
@@ -156,11 +157,12 @@ def notify(message, html=False):
     chat = env("TELEGRAM_CHAT_ID")
     if not token or not chat:
         return
-
+        
     params = {"chat_id": chat, "text": message[:3900], "disable_web_page_preview": "true"}
     if html:
-        params["parse_mode"] = "HTML"
-
+            params["parse_mode"] = "HTML"
+    if buttons:
+            params["reply_markup"] = json.dumps({"inline_keyboard": [buttons]})
     def worker():
         try:
             body = urllib.parse.urlencode(
