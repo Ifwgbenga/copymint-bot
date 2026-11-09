@@ -1371,12 +1371,19 @@ class Bot:
             log(f"telegram command startup failed: {type(exc).__name__}")
         while True:
             try:
-                params = {"timeout": 25, "allowed_updates": json.dumps(["message"])}
+                params = {"timeout": 25, "allowed_updates": json.dumps(["message", "callback_query"])}
                 if offset is not None:
                     params["offset"] = offset
                 for update in telegram_call("getUpdates", params).get("result") or []:
-                    offset = update["update_id"] + 1
-                    self.handle_command(update, chat_id)
+                                    offset = update["update_id"] + 1
+                if update.get("callback_query"):
+                    self.handle_callback(update["callback_query"], chat_id)
+                    continue
+                msg = update.get("message") or {}
+                if str((msg.get("chat") or {}).get("id", "")) == chat_id and (msg.get("text") or "").split("@")[0].strip().lower() == "/chain":
+                    self.send_chain_menu(chat_id)
+                    continue
+                self.handle_command(update, chat_id)
             except Exception as exc:
                 log(f"telegram command polling failed: {type(exc).__name__}")
                 time.sleep(10)
